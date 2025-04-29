@@ -1,0 +1,36 @@
+2025-04-29 12:15:15,327 - __main__ - INFO - Starting script.
+2025-04-29 12:15:48,574 - __main__ - INFO - Starting script.
+2025-04-29 12:15:48,574 - __main__ - INFO - Loading settings from 'settings.yaml'...
+2025-04-29 12:15:48,574 - __main__ - INFO - Settings loaded successfully from 'settings.yaml'.
+2025-04-29 12:15:48,574 - __main__ - INFO - Loaded 3 stakeholders.
+2025-04-29 12:15:48,574 - __main__ - INFO - Loading service account credentials from 'carbon-pride-374002-2dc0cf329724.json'...
+2025-04-29 12:15:48,577 - __main__ - INFO - Credentials loaded successfully.
+2025-04-29 12:15:48,577 - __main__ - INFO - Building Google Sheets API service...
+2025-04-29 12:15:48,577 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-04-29 12:15:48,819 - __main__ - INFO - Reading data from 'Orders'...
+2025-04-29 12:15:50,780 - __main__ - INFO - Read 3049 rows from 'Orders'.
+2025-04-29 12:15:50,780 - __main__ - INFO - Header row (row 2) with 31 columns identified.
+2025-04-29 12:15:50,790 - __main__ - INFO - Processed 3047 data rows.
+2025-04-29 12:15:50,795 - __main__ - INFO - Created DataFrame with 3047 rows and 32 columns.
+2025-04-29 12:15:50,800 - __main__ - INFO - Filtering rows based on priority statuses...
+2025-04-29 12:15:50,804 - __main__ - INFO - Found 221 rows matching priority statuses for potential assignment/date update.
+2025-04-29 12:15:50,805 - __main__ - INFO - Processing 221 filtered rows for assignments and date tracking.
+2025-04-29 12:15:50,806 - __main__ - INFO - Stakeholders assigned cyclically to 221 rows.
+2025-04-29 12:15:50,844 - __main__ - INFO - Date logic applied to 221 rows.
+2025-04-29 12:15:50,845 - __main__ - INFO - Preparing batch update for Orders sheet...
+2025-04-29 12:15:50,871 - __main__ - INFO - Prepared 221 row updates for Orders sheet batch write.
+2025-04-29 12:15:50,871 - __main__ - INFO - Executing batch update to Orders sheet...
+2025-04-29 12:15:51,746 - __main__ - INFO - Batch update completed. 884 cells updated.
+2025-04-29 12:15:51,746 - __main__ - INFO - Generating Stakeholder Report for this batch...
+2025-04-29 12:15:51,746 - __main__ - INFO - Initialized report counts.
+2025-04-29 12:15:51,760 - __main__ - INFO - Calculated report counts for 221 rows processed and assigned in this run.
+2025-04-29 12:15:51,760 - __main__ - INFO - Formatted report data (27 rows).
+2025-04-29 12:15:51,760 - __main__ - INFO - Writing report to 'Stakeholder Report'...
+2025-04-29 12:15:51,761 - __main__ - INFO - Searching for existing report section for 29-Apr-2025 in 'Stakeholder Report'...
+2025-04-29 12:15:52,286 - __main__ - INFO - Found existing report start for 29-Apr-2025 at row 1.
+2025-04-29 12:15:52,287 - __main__ - INFO - Existing report for 29-Apr-2025 found. Updating range Stakeholder Report!A1:Z27...
+2025-04-29 12:15:52,287 - __main__ - INFO - Clearing range: Stakeholder Report!A1:Z27
+2025-04-29 12:15:52,867 - __main__ - INFO - Cleared old report data.
+2025-04-29 12:15:52,868 - __main__ - INFO - Writing new report data to range: Stakeholder Report!A1
+2025-04-29 12:15:53,376 - __main__ - INFO - Report updated. 27 cells updated.
+2025-04-29 12:15:53,377 - __main__ - INFO - Script finished execution.

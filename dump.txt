@@ -1,0 +1,925 @@
+# import os.path
+# import datetime
+# import yaml
+# import pandas as pd
+# import logging
+# import sys # Import sys for logging to console
+
+# # Import necessary modules for Service Account authentication
+# from google.oauth2 import service_account
+# from googleapiclient.discovery import build
+# from googleapiclient.errors import HttpError
+
+# # --- Configuration ---
+# SPREADSHEET_ID = '1ZkTB3ahmrQ2-7rz-h1RdkOMPSHmkAhpFJIH64Ca0jxk'
+# ORDERS_SHEET_NAME = 'Orders'
+# REPORT_SHEET_NAME = 'Stakeholder Report'
+# SETTINGS_FILE = 'settings.yaml'
+# SERVICE_ACCOUNT_FILE = 'carbon-pride-374002-2dc0cf329724.json' # Using your specified file name
+
+# # Scopes required for reading and writing to Google Sheets
+# SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+# # Define the call status priorities and mapping for report categories
+# CALL_PRIORITIES = {
+#     1: ["NDR"],
+#     2: ["Confirmation Pending", "Fresh"],
+#     3: ["Call didn't Pick", "Follow up"],
+#     4: ["Abandoned", "Number invalid/fake order"]
+# }
+
+# # Mapping from status values to report categories
+# STATUS_TO_REPORT_CATEGORY = {
+#     "Fresh": "Fresh",
+#     "Confirmation Pending": "Fresh",
+#     "Abandoned": "Abandoned",
+#     "Number invalid/fake order": "Abandoned",
+#     "Call didn't Pick": "CNP",
+#     "Follow up": "Follow up",
+#     "NDR": "NDR"
+#     # Note: Any other status will contribute only to "Total", not a specific category
+# }
+
+# # Expected column headers (case-sensitive based on your list)
+# HEADER_ROW_INDEX = 1 # Apps Script uses data[1] as header, so it's the second row (0-indexed)
+# DATA_START_ROW_INDEX = 2 # Apps Script starts data processing from data[2] (third row)
+
+# COL_NAMES = {
+#     'call_status': 'Call-status',
+#     'order_status': 'order status', # Not used for filtering logic in script, but good to define
+#     'stakeholder': 'Stakeholder',
+#     'date_col': 'Date',
+#     # Add other columns if needed for context, though not used for logic here
+#     'id': 'Id',
+#     'name': 'Name',
+#     'created_at': 'Created At',
+#     'customer_id': 'Id (Customer)',
+# }
+
+# # --- Logging Setup ---
+# LOG_FILE = 'distribution_script.log'
+# logging.basicConfig(
+#     level=logging.INFO, # Set the minimum logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+#     handlers=[
+#         logging.FileHandler(LOG_FILE), # Log to a file
+#         logging.StreamHandler(sys.stdout) # Log to console
+#     ]
+# )
+# logger = logging.getLogger(__name__)
+
+# # --- Helper function to convert column index to A1 notation ---
+# def col_index_to_a1(index):
+#     """Converts a 0-indexed column number to a Google Sheets A1 column string."""
+#     col = ''
+#     while index >= 0:
+#         col = chr(index % 26 + ord('A')) + col
+#         index = index // 26 - 1
+#     return col
+
+# # --- Authentication Function (MODIFIED for Service Account and Logging) ---
+# def authenticate_google_sheets():
+#     """Authenticates using a service account key file."""
+#     creds = None
+#     logger.info(f"Attempting to load service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
+#     try:
+#         creds = service_account.Credentials.from_service_account_file(
+#             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+#         logger.info("Successfully loaded service account credentials.")
+#     except FileNotFoundError:
+#         logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
+#         logger.error("Please make sure the file is in the same directory as the script.")
+#         return None
+#     except Exception as e:
+#         logger.error(f"Error loading service account credentials: {e}")
+#         return None
+
+#     logger.info("Building Google Sheets API service...")
+#     try:
+#         service = build('sheets', 'v4', credentials=creds)
+#         # Optional: Test connection
+#         # service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+#         # logger.info("Successfully connected to Google Sheets API.")
+#         return service
+#     except HttpError as e:
+#          logger.error(f"Google Sheets API Error during service build or connection test: {e}")
+#          logger.error("Please ensure the service account has Editor access to the spreadsheet.")
+#          return None
+#     except Exception as e:
+#          logger.error(f"An unexpected error occurred during service build: {e}")
+#          return None
+
+
+# # --- Load Settings Function (with Logging) ---
+# def load_settings(filename):
+#     """Loads configuration from a YAML file."""
+#     logger.info(f"Loading settings from '{filename}'...")
+#     try:
+#         with open(filename, 'r') as f:
+#             settings = yaml.safe_load(f)
+#         if not settings:
+#              logger.warning(f"Settings file '{filename}' is empty.")
+#              return None
+#         logger.info(f"Settings loaded successfully from '{filename}'.")
+#         return settings
+#     except FileNotFoundError:
+#         logger.error(f"Error: Settings file '{filename}' not found.")
+#         return None
+#     except yaml.YAMLError as e:
+#         logger.error(f"Error parsing settings file '{filename}': {e}")
+#         return None
+#     except Exception as e:
+#         logger.error(f"An unexpected error occurred loading settings: {e}")
+#         return None
+
+# # --- Data Processing and Distribution (with Logging and Error Fix) ---
+# def distribute_and_report():
+#     """Reads data, distributes calls, writes back, and creates a report."""
+#     logger.info("Starting data distribution and reporting script.")
+
+#     settings = load_settings(SETTINGS_FILE)
+#     if not settings or 'stakeholders' not in settings:
+#         logger.error("Failed to load stakeholders from settings.yaml or 'stakeholders' key is missing. Aborting.")
+#         return
+
+#     stakeholder_list = settings['stakeholders']
+#     if not stakeholder_list:
+#         logger.error("Stakeholder list is empty in settings.yaml. Aborting.")
+#         return
+#     logger.info(f"Loaded {len(stakeholder_list)} stakeholders: {', '.join(stakeholder_list)}")
+
+
+#     # --- Authenticate ---
+#     service = authenticate_google_sheets()
+#     if not service:
+#         logger.error("Authentication failed. Aborting script.")
+#         return
+#     sheet = service.spreadsheets()
+
+#     try:
+#         # --- Read Data ---
+#         logger.info(f"Reading data from sheet '{ORDERS_SHEET_NAME}'...")
+#         # Use a wide range to make sure we capture all potential columns, even if sparse
+#         # reading from A1 to capture header and any rows before it
+#         result = sheet.values().get(spreadsheetId=SPREADSHEET_ID,
+#                                      range=f'{ORDERS_SHEET_NAME}!A:AZ').execute() # Consider a range that covers all columns, e.g., A:ZZ
+#         values = result.get('values', [])
+
+#         if not values:
+#             logger.warning(f"No data found in sheet '{ORDERS_SHEET_NAME}'.")
+#             return
+
+#         logger.info(f"Successfully read {len(values)} rows from '{ORDERS_SHEET_NAME}'.")
+
+#         # Identify header and data rows based on Apps Script logic (row 2 is header)
+#         if len(values) < DATA_START_ROW_INDEX + 1:
+#              logger.error(f"Not enough rows found in sheet '{ORDERS_SHEET_NAME}'. Need at least {DATA_START_ROW_INDEX + 1} rows (header + data). Found {len(values)}.")
+#              return
+
+#         # Use the header row from the actual values read from the sheet
+#         header = [str(h).strip() if h is not None else '' for h in values[HEADER_ROW_INDEX]]
+#         header_length = len(header)
+#         logger.info(f"Identified header row (row {HEADER_ROW_INDEX + 1}) with {header_length} columns.")
+
+#         # --- Pad Data Rows to Match Header Length (Fix for the error) ---
+#         # Only process rows that are supposed to be data rows (from DATA_START_ROW_INDEX onwards)
+#         data_rows_raw = values[DATA_START_ROW_INDEX:]
+#         padded_data_rows = []
+#         for i, row in enumerate(data_rows_raw):
+#             # Ensure each item in the row is a string or treat None as empty string
+#             processed_row = [str(cell).strip() if cell is not None else '' for cell in row]
+#             if len(processed_row) < header_length:
+#                 padding_needed = header_length - len(processed_row)
+#                 processed_row.extend([''] * padding_needed)
+#                 # logger.debug(f"Padded row {DATA_START_ROW_INDEX + i + 1} from {len(row)} to {header_length} columns.")
+#             elif len(processed_row) > header_length:
+#                  # This case should ideally not happen if the range A:AZ is used consistently
+#                  # and the header accurately reflects the intended number of columns.
+#                  # Log a warning, but proceed by truncating.
+#                  logger.warning(f"Row {DATA_START_ROW_INDEX + i + 1} has more columns ({len(processed_row)}) than header ({header_length}). Truncating to {header_length}.")
+#                  processed_row = processed_row[:header_length]
+
+#             padded_data_rows.append(processed_row)
+
+#         logger.info(f"Processed and padded {len(padded_data_rows)} data rows to match header length.")
+
+#         # Create DataFrame using the padded data and the extracted header
+#         df = pd.DataFrame(padded_data_rows, columns=header)
+#         # Store original sheet row index for writing back (1-based)
+#         # These are the rows *after* the header and any preceding rows
+#         df['_original_row_index'] = range(DATA_START_ROW_INDEX + 1, DATA_START_ROW_INDEX + 1 + len(df))
+#         logger.info(f"Created pandas DataFrame with {len(df)} rows and {len(df.columns)} columns.")
+
+
+#         # --- Prepare DataFrame Columns ---
+#         # Ensure required columns exist, add if not
+#         for col_key, col_name in COL_NAMES.items():
+#             if col_name not in df.columns:
+#                 logger.warning(f"Column '{col_name}' not found in DataFrame. Adding it as an empty column.")
+#                 df[col_name] = '' # Add empty column
+#             # Also ensure the column is of string type to avoid errors during assignment
+#             df[col_name] = df[col_name].astype(str)
+
+
+#         # Clean up status column - replace None/NaN with empty string, strip whitespace
+#         df[COL_NAMES['call_status']] = df[COL_NAMES['call_status']].fillna('').astype(str).str.strip()
+
+
+#         # --- Filter Rows ---
+#         logger.info("Filtering rows based on priority statuses...")
+#         # Combine all status values from all priorities into a single list
+#         all_priority_statuses = [status for priority_list in CALL_PRIORITIES.values() for status in priority_list]
+
+#         # Filter rows where 'Call-status' is in the list of prioritized statuses
+#         # Process all rows matching the status criteria regardless of existing assignment.
+#         # We filter based on the cleaned 'Call-status' column in the DataFrame
+#         filtered_df = df[df[COL_NAMES['call_status']].isin(all_priority_statuses)].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+#         logger.info(f"Found {len(filtered_df)} rows matching priority statuses for potential assignment.")
+
+#         filtered_indices = filtered_df.index.tolist() # Get indices of filtered rows in the original dataframe
+
+#         if not filtered_indices:
+#             logger.info("No rows matched the specified call statuses for distribution. Skipping assignments and updates.")
+#         else:
+#             # --- Assign Date and Stakeholder ---
+#             today_date_str = datetime.date.today().strftime("%d-%b-%Y")
+#             num_stakeholders = len(stakeholder_list)
+
+#             logger.info(f"Assigning today's date ({today_date_str}) and stakeholders cyclically to the {len(filtered_indices)} filtered rows.")
+
+#             # Calculate assignments
+#             assigned_stakeholders = [stakeholder_list[i % num_stakeholders] for i in range(len(filtered_indices))]
+
+#             # Apply assignments and date back to the original DataFrame using indices
+#             df.loc[filtered_indices, COL_NAMES['stakeholder']] = assigned_stakeholders
+#             df.loc[filtered_indices, COL_NAMES['date_col']] = today_date_str
+
+#             logger.info(f"Assignments and dates updated for {len(filtered_indices)} rows in DataFrame.")
+
+
+#             # --- Prepare Data for Writing (Batch Update) ---
+#             logger.info("Preparing batch update data for the Orders sheet...")
+
+#             updates = []
+#             # Get the 0-indexed column position in the original sheet data (based on header row)
+#             # Use the *processed* header list derived from the sheet data
+#             stakeholder_col_sheet_index = -1
+#             date_col_sheet_index = -1
+
+#             try:
+#                 stakeholder_col_sheet_index = header.index(COL_NAMES['stakeholder'])
+#                 logger.info(f"Found '{COL_NAMES['stakeholder']}' at 0-indexed column position {stakeholder_col_sheet_index} in header row.")
+#             except ValueError:
+#                 logger.error(f"Could not find '{COL_NAMES['stakeholder']}' in the sheet header row (row {HEADER_ROW_INDEX + 1}). Cannot write assignments for this column.")
+
+#             try:
+#                 date_col_sheet_index = header.index(COL_NAMES['date_col'])
+#                 logger.info(f"Found '{COL_NAMES['date_col']}' at 0-indexed column position {date_col_sheet_index} in header row.")
+#             except ValueError:
+#                 logger.error(f"Could not find '{COL_NAMES['date_col']}' in the sheet header row (row {HEADER_ROW_INDEX + 1}). Cannot write dates for this column.")
+
+#             # Proceed only if at least one target column was found
+#             if stakeholder_col_sheet_index != -1 or date_col_sheet_index != -1:
+#                  columns_to_update_indices = []
+#                  if stakeholder_col_sheet_index != -1:
+#                       columns_to_update_indices.append(stakeholder_col_sheet_index)
+#                  if date_col_sheet_index != -1:
+#                       columns_to_update_indices.append(date_col_sheet_index)
+
+#                  # Determine the maximum column index we need to write up to (for creating the row values list)
+#                  max_col_index_to_write = max(columns_to_update_indices)
+
+
+#                  for df_index in filtered_indices:
+#                      original_sheet_row = df.loc[df_index, '_original_row_index'] # This is 1-based sheet row number
+#                      assigned_stakeholder = df.loc[df_index, COL_NAMES['stakeholder']]
+#                      assigned_date = df.loc[df_index, COL_NAMES['date_col']]
+
+#                      # Create a list representing the row data from column A up to max_col_index_to_write
+#                      # Fill with None, then insert the values at the correct original sheet column indices
+#                      # This list will be written starting from A{original_sheet_row}
+#                      row_values_to_write = [None] * (max_col_index_to_write + 1)
+
+#                      if stakeholder_col_sheet_index != -1:
+#                           row_values_to_write[stakeholder_col_sheet_index] = assigned_stakeholder
+
+#                      if date_col_sheet_index != -1:
+#                           row_values_to_write[date_col_sheet_index] = assigned_date
+
+#                      # Define the range for this specific row, starting from column A
+#                      # The API will correctly place the values based on the list indices
+#                      range_for_row = f'{ORDERS_SHEET_NAME}!A{original_sheet_row}'
+
+#                      updates.append({
+#                          'range': range_for_row,
+#                          'values': [row_values_to_write] # Must be a list of lists
+#                      })
+
+#                  logger.info(f"Prepared {len(updates)} row updates for the Orders sheet.")
+
+#             else:
+#                  logger.warning("Neither Stakeholder nor Date column was found in the header. No updates to prepare.")
+
+
+#             # Execute the batch update if updates were prepared
+#             if updates:
+#                 logger.info("Executing batch update to the Orders sheet...")
+#                 body = {
+#                     'value_input_option': 'RAW',
+#                     'data': updates
+#                 }
+#                 try:
+#                     result = sheet.values().batchUpdate(
+#                         spreadsheetId=SPREADSHEET_ID, body=body).execute()
+#                     logger.info(f"Batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
+#                 except HttpError as e:
+#                     logger.error(f"Google Sheets API Error during batch update: {e}")
+#                 except Exception as e:
+#                      logger.exception("An unexpected error occurred during batch update:")
+
+#             else:
+#                  logger.info("No updates to write back to the Orders sheet.")
+
+#         # --- Generate Stakeholder Report ---
+#         logger.info("Generating Stakeholder Report...")
+
+#         # Calculate report data from the *updated* DataFrame (which now includes assignments)
+#         # Initialize report counts structure
+#         report_counts = {}
+#         for stakeholder in stakeholder_list:
+#             report_counts[stakeholder] = {
+#                 "Total": 0,
+#                 "Fresh": 0,
+#                 "Abandoned": 0,
+#                 "CNP": 0,
+#                 "Follow up": 0,
+#                 "NDR": 0
+#             }
+#         logger.info("Initialized report counts structure.")
+
+#         # Count calls for each stakeholder based on the assigned values in the DataFrame
+#         assigned_rows_count = 0
+#         for index, row in df.iterrows():
+#              assigned_stakeholder = row.get(COL_NAMES['stakeholder'], '') # Use .get for safety
+#              call_status = row.get(COL_NAMES['call_status'], '').strip()
+
+#              if assigned_stakeholder in report_counts: # Only count if assigned to one of the defined stakeholders
+#                  assigned_rows_count += 1
+#                  report_counts[assigned_stakeholder]["Total"] += 1
+
+#                  # Count specific status categories
+#                  report_category = STATUS_TO_REPORT_CATEGORY.get(call_status)
+#                  if report_category:
+#                      report_counts[assigned_stakeholder][report_category] += 1
+
+#         logger.info(f"Calculated report counts from {assigned_rows_count} assigned/processed rows in the DataFrame.")
+
+#         # Format the report data for writing using the original Apps Script format
+#         formatted_report_values = []
+#         for stakeholder in stakeholder_list:
+#              formatted_report_values.append([f"Calls assigned {stakeholder}"])
+#              formatted_report_values.append([f"- Total Calls - {report_counts[stakeholder]['Total']}"])
+#              formatted_report_values.append([f"- Fresh- {report_counts[stakeholder]['Fresh']}"])
+#              formatted_report_values.append([f"- Abandand- {report_counts[stakeholder]['Abandoned']}"])
+#              formatted_report_values.append([f"- CNP- {report_counts[stakeholder]['CNP']}"])
+#              formatted_report_values.append([f"- Follow up- {report_counts[stakeholder]['Follow up']}"])
+#              formatted_report_values.append([f"- NDR - {report_counts[stakeholder]['NDR']}"])
+#              # Add a blank line between stakeholders
+#              formatted_report_values.append([''])
+
+#         logger.info(f"Formatted report data for {len(stakeholder_list)} stakeholders.")
+
+#         # --- Write Report to Report Sheet ---
+#         logger.info(f"Writing report to sheet '{REPORT_SHEET_NAME}'...")
+#         # Check if report sheet exists, clear or create it
+#         try:
+#             logger.info(f"Attempting to clear existing data in '{REPORT_SHEET_NAME}'...")
+#             sheet.values().clear(spreadsheetId=SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A:Z').execute()
+#             logger.info(f"Cleared existing data in '{REPORT_SHEET_NAME}'.")
+
+#         except HttpError as e:
+#             if 'Unable to parse range' in str(e) or e.resp.status == 400: # Sheet likely doesn't exist (400 Bad Request usually indicates range issue)
+#                  logger.warning(f"Sheet '{REPORT_SHEET_NAME}' not found or range invalid. Attempting to create it.")
+#                  try:
+#                      body = {
+#                          'requests': [{
+#                              'addSheet': {
+#                                  'properties': {
+#                                      'title': REPORT_SHEET_NAME
+#                                  }
+#                              }
+#                          }]
+#                      }
+#                      sheet.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+#                      logger.info(f"Created sheet '{REPORT_SHEET_NAME}'.")
+#                  except Exception as create_err:
+#                       logger.error(f"Error creating sheet '{REPORT_SHEET_NAME}': {create_err}")
+#                       logger.error("Cannot proceed without report sheet. Aborting.")
+#                       return # Cannot proceed without report sheet
+
+#             else:
+#                 logger.error(f"Unexpected Google Sheets API Error while clearing sheet '{REPORT_SHEET_NAME}': {e}")
+#                 raise # Re-raise unexpected errors
+
+
+#         # Write the new report data
+#         if formatted_report_values:
+#             body = {'values': formatted_report_values}
+#             try:
+#                 result = sheet.values().update(
+#                     spreadsheetId=SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A1', # Start writing from A1
+#                     valueInputOption='RAW', body=body).execute()
+#                 logger.info(f"Successfully wrote report data. {result.get('updatedCells', 'N/A')} cells updated in '{REPORT_SHEET_NAME}'.")
+#             except HttpError as e:
+#                 logger.error(f"Google Sheets API Error while writing report: {e}")
+#             except Exception as e:
+#                  logger.exception("An unexpected error occurred while writing report:")
+
+#         else:
+#              logger.warning("No report data to write.")
+
+#         logger.info("Script finished execution.")
+
+#     except HttpError as err:
+#         logger.error(f"Google Sheets API Error during main script execution: {err}")
+#     except Exception as e:
+#         logger.exception("An unexpected error occurred during main script execution:")
+
+
+# # --- Main Execution ---
+# if __name__ == '__main__':
+#     distribute_and_report()
+
+
+
+import os.path
+import datetime
+import yaml
+import pandas as pd
+import logging
+import sys
+
+# Import necessary modules for Service Account authentication
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# --- Configuration ---
+SPREADSHEET_ID = '1ZkTB3ahmrQ2-7rz-h1RdkOMPSHmkAhpFJIH64Ca0jxk'
+ORDERS_SHEET_NAME = 'Orders'
+REPORT_SHEET_NAME = 'Stakeholder Report'
+SETTINGS_FILE = 'settings.yaml'
+SERVICE_ACCOUNT_FILE = 'carbon-pride-374002-2dc0cf329724.json'
+
+# Scopes required for reading and writing
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+# Define call status priorities and report categories
+CALL_PRIORITIES = {
+    1: ["NDR"],
+    2: ["Confirmation Pending", "Fresh"],
+    3: ["Call didn't Pick", "Follow up"],
+    4: ["Abandoned", "Number invalid/fake order"]
+}
+
+STATUS_TO_REPORT_CATEGORY = {
+    "Fresh": "Fresh",
+    "Confirmation Pending": "Fresh",
+    "Abandoned": "Abandoned",
+    "Number invalid/fake order": "Abandoned",
+    "Call didn't Pick": "CNP",
+    "Follow up": "Follow up",
+    "NDR": "NDR"
+}
+
+# Sheet structure definition
+HEADER_ROW_INDEX = 1 # 0-indexed
+DATA_START_ROW_INDEX = 2 # 0-indexed
+
+COL_NAMES = {
+    'call_status': 'Call-status',
+    'order_status': 'order status',
+    'stakeholder': 'Stakeholder',
+    'date_col': 'Date',
+    'id': 'Id',
+    'name': 'Name',
+    'created_at': 'Created At',
+    'customer_id': 'Id (Customer)',
+}
+
+# --- Logging Setup ---
+LOG_FILE = 'distribution_script.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- Load Settings Function ---
+def load_settings(filename):
+    """Loads configuration from a YAML file."""
+    logger.info(f"Loading settings from '{filename}'...")
+    try:
+        with open(filename, 'r') as f:
+            settings = yaml.safe_load(f)
+        if not settings:
+             logger.warning(f"Settings file '{filename}' is empty.")
+             return None
+        logger.info(f"Settings loaded successfully from '{filename}'.")
+        return settings
+    except FileNotFoundError:
+        logger.error(f"Error: Settings file '{filename}' not found.")
+        return None
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing settings file '{filename}': {e}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred loading settings: {e}")
+        return None
+
+
+# --- Helper function ---
+def col_index_to_a1(index):
+    col = ''
+    while index >= 0:
+        col = chr(index % 26 + ord('A')) + col
+        index = index // 26 - 1
+    return col
+
+# --- Authentication ---
+def authenticate_google_sheets():
+    creds = None
+    logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        logger.info("Credentials loaded successfully.")
+    except FileNotFoundError:
+        logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading service account credentials: {e}")
+        return None
+
+    logger.info("Building Google Sheets API service...")
+    try:
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+    except HttpError as e:
+         logger.error(f"Google Sheets API Error during service build: {e}")
+         logger.error("Ensure the service account has Editor access to the spreadsheet.")
+         return None
+    except Exception as e:
+         logger.error(f"Unexpected error during service build: {e}")
+         return None
+
+# --- Function to find an existing report range for today ---
+def find_existing_report_range(sheet, spreadsheet_id, report_sheet_name, today_date_str):
+    """
+    Searches the report sheet for a report section starting with today's date.
+    Returns (start_row_1based, end_row_1based) if found, otherwise (None, None).
+    The end_row is the last row of the section to be cleared/overwritten.
+    """
+    start_title = f"--- Stakeholder Report for Assignments on {today_date_str} ---"
+    any_report_start_pattern = "--- Stakeholder Report for Assignments on "
+
+    logger.info(f"Searching for existing report section for {today_date_str} in '{report_sheet_name}'...")
+
+    start_row = None # 1-based index of today's report start
+    next_start_row = None # 1-based index of the start of the next report section
+
+    try:
+        result = sheet.values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f'{report_sheet_name}!A:A'
+        ).execute()
+        values = result.get('values', [])
+        logger.debug(f"Read {len(values)} rows from column A of '{report_sheet_name}'.")
+
+        # Find the start of today's report
+        for i in range(len(values)):
+            row_value = values[i][0].strip() if values[i] and values[i][0] else ''
+            if row_value == start_title:
+                start_row = i + 1 # 1-based index
+                logger.info(f"Found existing report start for {today_date_str} at row {start_row}.")
+                break
+
+        if start_row is None:
+            logger.info(f"No existing report found for {today_date_str}.")
+            return None, None # Not found
+
+        # Search for the start of the *next* report section after today's report started
+        for i in range(start_row, len(values)): # i is 1-based here
+             row_value = values[i][0].strip() if values[i] and values[i][0] else ''
+             if row_value.startswith(any_report_start_pattern) and (i + 1) > start_row:
+                  next_start_row = i + 1 # 1-based index
+                  logger.debug(f"Found start of next report section at row {next_start_row}.")
+                  break
+
+        # Determine the end row for clearing: 1 row before the next report start, or the last row of the sheet
+        if next_start_row is not None:
+             end_row_to_clear = next_start_row - 1
+             logger.debug(f"Calculated clear end row based on next report start: {end_row_to_clear}")
+        else:
+             end_row_to_clear = len(values) # Clear to the very end of the sheet
+             logger.debug(f"Calculated clear end row based on end of sheet: {end_row_to_clear}")
+
+        # Ensure end_row_to_clear is not less than start_row (handles edge case if markers are right next to each other)
+        end_row_to_clear = max(start_row, end_row_to_clear)
+
+
+        return start_row, end_row_to_clear
+
+    except HttpError as e:
+        if 'Unable to parse range' in str(e) or e.resp.status == 400:
+            logger.warning(f"Sheet '{report_sheet_name}' not found when searching for existing report. It will be created.")
+            return None, None
+        else:
+            logger.error(f"Google Sheets API Error while searching for existing report: {e}")
+            raise
+    except Exception as e:
+        logger.exception(f"Unexpected error while searching for existing report:")
+        return None, None
+
+# --- Main Processing Function ---
+def distribute_and_report():
+    logger.info("Starting script.")
+
+    settings = load_settings(SETTINGS_FILE)
+    if not settings or 'stakeholders' not in settings:
+        logger.error("Failed to load stakeholders. Aborting.")
+        return
+
+    stakeholder_list = settings['stakeholders']
+    if not stakeholder_list:
+        logger.error("Stakeholder list is empty. Aborting.")
+        return
+    logger.info(f"Loaded {len(stakeholder_list)} stakeholders.")
+
+    service = authenticate_google_sheets()
+    if not service:
+        logger.error("Authentication failed. Aborting script.")
+        return
+    sheet = service.spreadsheets()
+
+    try:
+        # --- Read Data ---
+        logger.info(f"Reading data from '{ORDERS_SHEET_NAME}'...")
+        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=f'{ORDERS_SHEET_NAME}!A:AZ').execute()
+        values = result.get('values', [])
+
+        if not values:
+            logger.warning(f"No data found in '{ORDERS_SHEET_NAME}'.")
+            return
+
+        logger.info(f"Read {len(values)} rows from '{ORDERS_SHEET_NAME}'.")
+
+        if len(values) < DATA_START_ROW_INDEX + 1:
+             logger.error(f"Not enough rows in '{ORDERS_SHEET_NAME}'. Need at least {DATA_START_ROW_INDEX + 1}. Found {len(values)}.")
+             return
+
+        header = [str(h).strip() if h is not None else '' for h in values[HEADER_ROW_INDEX]]
+        header_length = len(header)
+        logger.info(f"Header row (row {HEADER_ROW_INDEX + 1}) with {header_length} columns identified.")
+
+        # --- Pad Data Rows ---
+        data_rows_raw = values[DATA_START_ROW_INDEX:]
+        padded_data_rows = []
+        for i, row in enumerate(data_rows_raw):
+            processed_row = [str(cell).strip() if cell is not None else '' for cell in row]
+            if len(processed_row) < header_length:
+                processed_row.extend([''] * (header_length - len(processed_row)))
+            elif len(processed_row) > header_length:
+                 logger.warning(f"Row {DATA_START_ROW_INDEX + i + 1} has more columns ({len(processed_row)}) than header ({header_length}). Truncating.")
+                 processed_row = processed_row[:header_length]
+            padded_data_rows.append(processed_row)
+
+        logger.info(f"Processed {len(padded_data_rows)} data rows.")
+
+        df = pd.DataFrame(padded_data_rows, columns=header)
+        df['_original_row_index'] = range(DATA_START_ROW_INDEX + 1, DATA_START_ROW_INDEX + 1 + len(df))
+        logger.info(f"Created DataFrame with {len(df)} rows and {len(df.columns)} columns.")
+
+        # --- Prepare DataFrame Columns ---
+        for col_key, col_name in COL_NAMES.items():
+            if col_name not in df.columns:
+                logger.warning(f"Column '{col_name}' not found. Adding empty column.")
+                df[col_name] = ''
+            df[col_name] = df[col_name].astype(str)
+
+        df[COL_NAMES['call_status']] = df[COL_NAMES['call_status']].fillna('').astype(str).str.strip()
+
+        # --- Filter Rows ---
+        logger.info("Filtering rows based on priority statuses...")
+        all_priority_statuses = [status for priority_list in CALL_PRIORITIES.values() for status in priority_list]
+        filtered_df = df[df[COL_NAMES['call_status']].isin(all_priority_statuses)].copy()
+
+        logger.info(f"Found {len(filtered_df)} rows matching priority statuses for assignment.")
+
+        filtered_indices = filtered_df.index.tolist()
+
+        if not filtered_indices:
+            logger.info("No rows matched filter criteria. Skipping assignments and report.")
+            return
+        else:
+            # --- Assign Date and Stakeholder ---
+            today_date_str = datetime.date.today().strftime("%d-%b-%Y")
+            num_stakeholders = len(stakeholder_list)
+
+            logger.info(f"Assigning {today_date_str} and stakeholders to {len(filtered_indices)} rows.")
+            assigned_stakeholders = [stakeholder_list[i % num_stakeholders] for i in range(len(filtered_indices))]
+
+            df.loc[filtered_indices, COL_NAMES['stakeholder']] = assigned_stakeholders
+            df.loc[filtered_indices, COL_NAMES['date_col']] = today_date_str
+            logger.info("Assignments updated in DataFrame.")
+
+            # --- Prepare Batch Update ---
+            logger.info("Preparing batch update for Orders sheet...")
+            updates = []
+            stakeholder_col_sheet_index = -1
+            date_col_sheet_index = -1
+
+            try:
+                stakeholder_col_sheet_index = header.index(COL_NAMES['stakeholder'])
+            except ValueError:
+                logger.error(f"Column '{COL_NAMES['stakeholder']}' not found in header. Cannot write assignments.")
+
+            try:
+                date_col_sheet_index = header.index(COL_NAMES['date_col'])
+            except ValueError:
+                logger.error(f"Column '{COL_NAMES['date_col']}' not found in header. Cannot write dates.")
+
+            if stakeholder_col_sheet_index != -1 or date_col_sheet_index != -1:
+                 max_col_index_to_write = -1
+                 if stakeholder_col_sheet_index != -1: max_col_index_to_write = max(max_col_index_to_write, stakeholder_col_sheet_index)
+                 if date_col_sheet_index != -1: max_col_index_to_write = max(max_col_index_to_write, date_col_sheet_index)
+
+                 if max_col_index_to_write != -1:
+                      for df_index in filtered_indices:
+                          original_sheet_row = df.loc[df_index, '_original_row_index']
+                          assigned_stakeholder = df.loc[df_index, COL_NAMES['stakeholder']]
+                          assigned_date = df.loc[df_index, COL_NAMES['date_col']]
+
+                          row_values_to_write = [None] * (max_col_index_to_write + 1)
+                          if stakeholder_col_sheet_index != -1: row_values_to_write[stakeholder_col_sheet_index] = assigned_stakeholder
+                          if date_col_sheet_index != -1: row_values_to_write[date_col_sheet_index] = assigned_date
+
+                          updates.append({
+                              'range': f'{ORDERS_SHEET_NAME}!A{original_sheet_row}',
+                              'values': [row_values_to_write]
+                          })
+                      logger.info(f"Prepared {len(updates)} row updates.")
+            else:
+                 logger.warning("No target columns found for writing. No updates prepared.")
+
+            # Execute batch update
+            if updates:
+                logger.info("Executing batch update...")
+                body = {'value_input_option': 'RAW', 'data': updates}
+                try:
+                    result = sheet.values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+                    logger.info(f"Batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
+                except HttpError as e:
+                    logger.error(f"API Error during batch update: {e}")
+                except Exception as e:
+                     logger.exception("Unexpected error during batch update:")
+            else:
+                 logger.info("No updates to write back to Orders sheet.")
+
+            # --- Generate Stakeholder Report for THIS RUN ---
+            logger.info("Generating Stakeholder Report for this batch...")
+
+            report_counts = {}
+            for stakeholder in stakeholder_list:
+                report_counts[stakeholder] = {"Total": 0, "Fresh": 0, "Abandoned": 0, "CNP": 0, "Follow up": 0, "NDR": 0}
+            logger.info("Initialized report counts.")
+
+            assigned_rows_processed_count = 0
+            for index, row in filtered_df.iterrows():
+                 assigned_stakeholder = df.loc[index, COL_NAMES['stakeholder']] # Get from updated df
+                 call_status = row.get(COL_NAMES['call_status'], '').strip()
+
+                 if assigned_stakeholder in report_counts:
+                     assigned_rows_processed_count += 1
+                     report_category = STATUS_TO_REPORT_CATEGORY.get(call_status)
+                     if report_category:
+                         report_counts[assigned_stakeholder][report_category] += 1
+
+            logger.info(f"Calculated report counts for {assigned_rows_processed_count} assigned rows.")
+
+            formatted_report_values = []
+            formatted_report_values.append([f"--- Stakeholder Report for Assignments on {today_date_str} ---"])
+            formatted_report_values.append([''])
+
+            for stakeholder in stakeholder_list:
+                 total_assigned_this_run = sum(report_counts[stakeholder][cat] for cat in ["Fresh", "Abandoned", "CNP", "Follow up", "NDR"])
+                 report_counts[stakeholder]["Total"] = total_assigned_this_run
+
+                 formatted_report_values.append([f"Calls assigned {stakeholder}"])
+                 formatted_report_values.append([f"- Total Calls This Run - {report_counts[stakeholder]['Total']}"])
+                 formatted_report_values.append([f"- Fresh- {report_counts[stakeholder]['Fresh']}"])
+                 formatted_report_values.append([f"- Abandand- {report_counts[stakeholder]['Abandoned']}"])
+                 formatted_report_values.append([f"- CNP- {report_counts[stakeholder]['CNP']}"])
+                 formatted_report_values.append([f"- Follow up- {report_counts[stakeholder]['Follow up']}"])
+                 formatted_report_values.append([f"- NDR - {report_counts[stakeholder]['NDR']}"])
+                 formatted_report_values.append([''])
+
+            formatted_report_values.append(['--- End of Report for ' + today_date_str + ' ---'])
+            # formatted_report_values.append(['']) # Optional extra blank line after end marker
+
+            logger.info(f"Formatted report data ({len(formatted_report_values)} rows).")
+
+            # --- Write Report (Update or Append) ---
+            logger.info(f"Writing report to '{REPORT_SHEET_NAME}'...")
+
+            today_date_str = datetime.date.today().strftime("%d-%b-%Y")
+
+            start_row_existing, end_row_existing = find_existing_report_range(
+                sheet, SPREADSHEET_ID, REPORT_SHEET_NAME, today_date_str
+            )
+
+            if start_row_existing is not None and end_row_existing is not None:
+                # --- Update Existing Report ---
+                logger.info(f"Existing report for {today_date_str} found. Updating range {REPORT_SHEET_NAME}!A{start_row_existing}:Z{end_row_existing}...")
+                range_to_clear = f'{REPORT_SHEET_NAME}!A{start_row_existing}:Z{end_row_existing}'
+                range_to_write_new = f'{REPORT_SHEET_NAME}!A{start_row_existing}'
+
+                try:
+                    logger.info(f"Clearing range: {range_to_clear}")
+                    sheet.values().clear(spreadsheetId=SPREADSHEET_ID, range=range_to_clear).execute()
+                    logger.info("Cleared old report data.")
+
+                    logger.info(f"Writing new report data to range: {range_to_write_new}")
+                    body = {'values': formatted_report_values}
+                    result = sheet.values().update(
+                        spreadsheetId=SPREADSHEET_ID, range=range_to_write_new,
+                        valueInputOption='RAW', body=body).execute()
+                    logger.info(f"Report updated. {result.get('updatedCells', 'N/A')} cells updated.")
+
+                except HttpError as e:
+                    logger.error(f"API Error while updating report: {e}")
+                except Exception as e:
+                     logger.exception("Unexpected error while updating report:")
+
+            else:
+                # --- Append New Report ---
+                logger.info(f"No existing report for {today_date_str}. Appending new report...")
+
+                start_row_for_append = 1
+                try:
+                     result_existing_report = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A:A').execute()
+                     existing_values = result_existing_report.get('values', [])
+                     if existing_values:
+                         start_row_for_append = len(existing_values) + 1
+                     logger.info(f"Found {len(existing_values)} existing rows. New report starts at row {start_row_for_append}.")
+
+                except HttpError as e:
+                     if 'Unable to parse range' in str(e) or e.resp.status == 400:
+                          logger.warning(f"Sheet '{REPORT_SHEET_NAME}' not found when checking append position. Creating it.")
+                          try:
+                              body = {'requests': [{'addSheet': {'properties': {'title': REPORT_SHEET_NAME}}}]}
+                              sheet.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+                              logger.info(f"Created sheet '{REPORT_SHEET_NAME}'. Report starts at row {start_row_for_append}.")
+                          except Exception as create_err:
+                               logger.error(f"Error creating sheet '{REPORT_SHEET_NAME}': {create_err}")
+                               logger.error("Cannot proceed with report. Aborting.")
+                               return
+
+                     else:
+                         logger.error(f"API Error while checking/reading sheet for append: {e}")
+                         raise
+                except Exception as e:
+                     logger.exception(f"Unexpected error while finding last row:")
+                     return
+
+                if formatted_report_values:
+                    body = {'values': formatted_report_values}
+                    range_to_write_report = f'{REPORT_SHEET_NAME}!A{start_row_for_append}'
+                    logger.info(f"Writing report data to range '{range_to_write_report}'.")
+                    try:
+                        result = sheet.values().update(
+                            spreadsheetId=SPREADSHEET_ID, range=range_to_write_report,
+                            valueInputOption='RAW', body=body).execute()
+                        logger.info(f"Report written. {result.get('updatedCells', 'N/A')} cells updated.")
+                    except HttpError as e:
+                        logger.error(f"API Error while writing report: {e}")
+                    except Exception as e:
+                         logger.exception("Unexpected error while writing report:")
+                else:
+                     logger.warning("No report data to write.")
+
+        logger.info("Script finished execution.")
+
+    except HttpError as err:
+        logger.error(f"Google Sheets API Error during main execution: {err}")
+    except Exception as e:
+        logger.exception("Unexpected error during main execution:")
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    distribute_and_report()

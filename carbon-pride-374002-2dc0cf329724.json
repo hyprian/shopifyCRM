@@ -1,0 +1,12 @@
+{
+  "type": "service_account",
+  "project_id": "carbon-pride-374002",
+  "private_key_id": "2dc0cf32972443ab6ddb46832b80ce8d578fd038",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDSfKcMy4MTv4IO\nWnQkkPr7c4ksdouWYli4O1MjZkIHGibOeT6pX2ZEm+v2bSUUd3nDyKiMgNTvrVQm\nxdkhkNw1Nu+BRWLrbTek3YWBqVcq5L7RF8q5tkzK1K04oi+JfGjPy86cby3rDHK7\nYTjT2Fu94Ibm2z9MnCOjF0aGgksZZD7YzZpctv4ix2mAJaFGAKek4Nq6xNfZclbu\n3GvcHuvE5jZg9kFhRrfXujUzkj/RhUGOlJlM9uorh0mSpzhd2FKBzmLz/+3k7AuH\ned7IXt1BOosUCOpLuZRy/9r93a2UYO8YXJtMrmlltc70WQALqZ1L3zVihhgR0ZSg\n/HrSP8PHAgMBAAECggEABs7uY60PhoDVdvEOZwJjg+T8T7pekH+KNBytzJbUVZYk\ndt2YHR1krvJw2E3hJaopqkoKyE9V0+eCMdDeJvD1wSjk6AReYJQYo9YLKU2uGp6U\nh384A6LLFW0kqeYhGIGJgwh/cd2Xbs4TxfjX6uOe2rjw/sr3tLArkkJrTxLW1Vwy\n378W2NG+way1AdIeRRO5qlkFls3O7Vi6TklLzCPiCJIfcgtwEJUuy7QKlabOVSWO\nBPBnSRiF6AVpOhfTxCyDW4YPokg7Wv9C4yTOtcmmD83YFVnswt/xJCA8bZ1zGO4h\nW/uQ23CKQ2UVngQv2OWYQ75BLKgQ2f/VIxDwRl9WiQKBgQDv758Vi+PyIvzc9GeA\nVH0/nzptNJ7MAeqYHchwAezOWPmCziokHqboG2x5G+xufV8SC7TZHFcK6hSnOgWz\nGSeqEcWcC6inh/Xpba8GorgAZnydN89yGxDxgYYNdjuptqLv91o06KbuF3KEwXkR\n1Uo0Ck2QmPwpV1dWE3HneL0fXwKBgQDglEn2FV36GHOd+QoO7Qut+dpdM55hSLU2\n/tsDYz3Jt6pHeB9eNXOBdC/UuaA5ZJYxyU8bxQGmjTBimjMJzpGtmx3fHp7Z7fHm\neY4TywkKxUwpp7s3kK6Xn5zMPVE348sLX3QZQxKwMCuy+DojQg22/MqYDrADNdDg\nTwQ+nbp8mQKBgHxvtPzSuVyKAsSBSPCIYRDO/tlGUhkR4V4VDC/y/6KhCH5rd/WV\npBB6sI47CirfgJ/2TEvRY984OY/lCrGxGR4d63ObpFOGsuXmScDSQUWL4ZMUL9VI\n7keiWii/KgBBxU1Y5oLMKk8PAAiT4rt59+r3cPTOMvEp6BSvLwLSXptXAoGAAMK/\n1WORI+29RoW3cQGAjqBQCwzHtpCmfH80grhtVyeWHhPcF1ebAo9AMjpGvqsGjzid\nWfy62rOTvGHFVn0qpSnnWgAijZ5uuVckEhEYAL9WWLXGvpNw4/aYc2Cpy8SrxWgX\nXpaJk6s2Gq8Yk1H/9eS5UvaJxhkCkh/yZbvnC9ECgYBasUO+gjQBJ+E4jQowbMi9\nojfj2FtVVOnnoeygRzziXB/GLRdOF4Lpbq+MeIFEYLwpQ43Wx4G4ELxeEFtZChHa\nZMsDsY3Jq1t3a2/ZfqfFaLcsFLjQ5tBWX+B1kKSKDO1rwrG36LBe8+yv4I13vYdG\n/pv8D+rRqeNPQ/ntShDuAA==\n-----END PRIVATE KEY-----\n",
+  "client_email": "py-bot@carbon-pride-374002.iam.gserviceaccount.com",
+  "client_id": "109283507760824502196",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/py-bot%40carbon-pride-374002.iam.gserviceaccount.com"
+}
