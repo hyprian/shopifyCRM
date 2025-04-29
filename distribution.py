@@ -18,8 +18,7 @@ SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'carbon-pride-374002-2dc0cf329724.json'
 
 # Scopes required for reading and writing
-# CORRECTED SCOPE: Removed the duplicate part
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets'] # Correct scope
 
 # Define call status priorities and report categories
 CALL_PRIORITIES = {
@@ -29,11 +28,12 @@ CALL_PRIORITIES = {
     4: ["Abandoned", "Number invalid/fake order"]
 }
 
+# MODIFIED: Split 'Abandoned' and 'Number invalid/fake order' for reporting
 STATUS_TO_REPORT_CATEGORY = {
     "Fresh": "Fresh",
     "Confirmation Pending": "Fresh",
     "Abandoned": "Abandoned",
-    "Number invalid/fake order": "Abandoned",
+    "Number invalid/fake order": "Invalid/Fake", 
     "Call didn't Pick": "CNP",
     "Follow up": "Follow up",
     "NDR": "NDR"
@@ -54,6 +54,7 @@ COL_NAMES = {
     'name': 'Name',
     'created_at': 'Created At',
     'customer_id': 'Id (Customer)',
+    # ... potentially more columns based on your full header ...
 }
 
 # --- Logging Setup ---
@@ -68,7 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Load Settings Function (with Logging) ---
+# --- Load Settings Function ---
 def load_settings(filename):
     """Loads configuration from a YAML file."""
     logger.info(f"Loading settings from '{filename}'...")
@@ -100,6 +101,7 @@ def col_index_to_a1(index):
 
 # --- Authentication ---
 def authenticate_google_sheets():
+    """Authenticates using a service account key file."""
     creds = None
     logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
     try:
@@ -390,13 +392,22 @@ def distribute_and_report():
             else:
                  logger.info("No updates to write back to Orders sheet.")
 
-            # --- Generate Stakeholder Report for THIS RUN ---
+            # --- Generate Stakeholder Report for THIS RUN (MODIFIED) ---
             logger.info("Generating Stakeholder Report for this batch...")
 
+            # Initialize report counts structure, including the new category
             report_counts = {}
             for stakeholder in stakeholder_list:
-                report_counts[stakeholder] = {"Total": 0, "Fresh": 0, "Abandoned": 0, "CNP": 0, "Follow up": 0, "NDR": 0}
-            logger.info("Initialized report counts.")
+                report_counts[stakeholder] = {
+                    "Total": 0,
+                    "Fresh": 0,
+                    "Abandoned": 0,
+                    "Invalid/Fake": 0, # Added the new category here
+                    "CNP": 0,
+                    "Follow up": 0,
+                    "NDR": 0
+                }
+            logger.info("Initialized report counts structure.")
 
             # Count calls for each stakeholder based ONLY on the rows that were just filtered and assigned
             assigned_rows_processed_count = 0
@@ -412,22 +423,29 @@ def distribute_and_report():
 
             logger.info(f"Calculated report counts for {assigned_rows_processed_count} rows processed and assigned in this run.")
 
+            # Format the report data for writing using the original Apps Script format (MODIFIED)
             formatted_report_values = []
             formatted_report_values.append([f"--- Stakeholder Report for Assignments on {today_date_str_for_report} ---"])
             formatted_report_values.append([''])
 
+            # Define the order of categories for the report output
+            report_category_order = ["Fresh", "Abandoned", "Invalid/Fake", "CNP", "Follow up", "NDR"] # Added Invalid/Fake here
+
             for stakeholder in stakeholder_list:
-                 total_assigned_this_run = sum(report_counts[stakeholder][cat] for cat in ["Fresh", "Abandoned", "CNP", "Follow up", "NDR"])
+                 # Calculate Total based on the sum of categories for this stakeholder in this run
+                 # MODIFIED: Include 'Invalid/Fake' in the total sum
+                 total_assigned_this_run = sum(report_counts[stakeholder].get(cat, 0) for cat in report_category_order) # Sum only defined categories
                  report_counts[stakeholder]["Total"] = total_assigned_this_run
 
                  formatted_report_values.append([f"Calls assigned {stakeholder}"])
                  formatted_report_values.append([f"- Total Calls This Run - {report_counts[stakeholder]['Total']}"])
-                 formatted_report_values.append([f"- Fresh- {report_counts[stakeholder]['Fresh']}"])
-                 formatted_report_values.append([f"- Abandand- {report_counts[stakeholder]['Abandoned']}"])
-                 formatted_report_values.append([f"- CNP- {report_counts[stakeholder]['CNP']}"])
-                 formatted_report_values.append([f"- Follow up- {report_counts[stakeholder]['Follow up']}"])
-                 formatted_report_values.append([f"- NDR - {report_counts[stakeholder]['NDR']}"])
-                 formatted_report_values.append([''])
+
+                 # Append categories in the defined order
+                 for category in report_category_order:
+                     # Use .get(category, 0) in case a category somehow wasn't initialized (shouldn't happen, but safe)
+                     formatted_report_values.append([f"- {category}- {report_counts[stakeholder].get(category, 0)}"])
+
+                 formatted_report_values.append(['']) # Blank line after each stakeholder block
 
             formatted_report_values.append(['--- End of Report for ' + today_date_str_for_report + ' ---'])
 
@@ -436,6 +454,7 @@ def distribute_and_report():
             # --- Write Report (Update or Append) ---
             logger.info(f"Writing report to '{REPORT_SHEET_NAME}'...")
 
+            # Use the same today_date_str for finding existing report
             start_row_existing, end_row_existing = find_existing_report_range(
                 sheet, SPREADSHEET_ID, REPORT_SHEET_NAME, today_date_str_for_report
             )
