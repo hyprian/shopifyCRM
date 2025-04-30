@@ -10,14 +10,14 @@ from googleapiclient.errors import HttpError
 
 # --- Configuration ---
 # Main Orders Sheet
-SPREADSHEET_ID = '1ZkTB3ahmrQ2-7rz-h1RdkOMPSHmkAhpFJIH64Ca0jxk'
+SPREADSHEET_ID = '17x0SVsHU73z6cpshrTtGiXi9X1NfBXnjAUCw6Y0C8H4'
 ORDERS_SHEET_NAME = 'Orders'
 ORDERS_HEADER_ROW_INDEX = 1  # Orders sheet header is row 2 (0-indexed)
 ORDERS_DATA_START_ROW_INDEX = 2  # Orders sheet data starts row 3 (0-indexed)
 
 # Abandoned Orders Sheet
-ABANDONED_SPREADSHEET_ID = '1U9R5UM_9Uom48cAhL9j3LMGd5I4o4v5sseGdOCkBDnA'
-ABANDONED_SHEET_NAME = 'Sheet1'  # Change to actual sheet name if different
+ABANDONED_SPREADSHEET_ID = '14ZnB0AtEzbeDidHWL1mULPnsWaN6EtPu-qhdirKb2SM'
+ABANDONED_SHEET_NAME = 'Sheet1'
 ABANDONED_HEADER_ROW_INDEX = 0  # Abandoned sheet header is row 1 (0-indexed)
 ABANDONED_DATA_START_ROW_INDEX = 1  # Abandoned sheet data starts row 2 (0-indexed)
 
@@ -55,7 +55,7 @@ COL_NAMES_ORDERS = {
     'call_status': 'Call-status',
     'order_status': 'order status',
     'stakeholder': 'Stakeholder',
-    'date_col_1': 'Date',  # Date 1 in Orders sheet context
+    'date_col_1': 'Date',
     'date_col_2': 'Date 2',
     'date_col_3': 'Date 3',
     'id': 'Id',
@@ -65,7 +65,7 @@ COL_NAMES_ORDERS = {
 }
 
 COL_NAMES_ABANDONED = {
-    'calling_status': 'Calling Status',
+    'calling_status': 'Call Status',
     'stakeholder': 'Stake Holder',
     'date_col_1': 'Date 1',
     'date_col_2': 'Date 2',
@@ -221,7 +221,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
     sheet = service.spreadsheets()
     today_date_str_for_sheet = datetime.date.today().strftime("%d-%b-%Y")
     
-    # Initialize report counts for abandoned orders (only Abandoned category needed)
+    # Initialize report counts for abandoned orders
     abandoned_report_counts = {stakeholder['name']: {"Total": 0, "Abandoned": 0} for stakeholder in stakeholder_list}
 
     try:
@@ -280,12 +280,13 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
         # Clean calling status
         abandoned_df[COL_NAMES_ABANDONED['calling_status']] = abandoned_df[COL_NAMES_ABANDONED['calling_status']].fillna('').astype(str).str.strip()
 
-        # Filter rows where calling status is empty
-        logger.info("Filtering abandoned rows with empty Calling Status...")
+        # Filter rows where Call Status is blank
+        logger.info("Filtering abandoned rows with blank Call Status...")
+        exclude_statuses = ['Confirmed', 'Cancel', 'Whatsapp', "Didn't Pickup", 'Follow Up']
         abandoned_to_process_df = abandoned_df[abandoned_df[COL_NAMES_ABANDONED['calling_status']] == ''].copy()
         abandoned_filtered_indices = abandoned_to_process_df.index.tolist()
 
-        logger.info(f"Found {len(abandoned_filtered_indices)} abandoned rows with empty calling status.")
+        logger.info(f"Found {len(abandoned_filtered_indices)} abandoned rows with blank Call Status.")
 
         if not abandoned_filtered_indices:
             logger.info("No abandoned rows matched filter criteria. Skipping assignments.")
@@ -330,7 +331,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
 
         if max_col_index_to_write_abandoned != -1:
             for df_index in abandoned_filtered_indices:
-                if abandoned_df.loc[df_index, COL_NAMES_ABANDONED['stakeholder']]:  # Only update rows with assigned stakeholders
+                if abandoned_df.loc[df_index, COL_NAMES_ABANDONED['stakeholder']]:
                     original_sheet_row = abandoned_df.loc[df_index, '_original_row_index']
                     row_values_to_write = [None] * (max_col_index_to_write_abandoned + 1)
                     for col_name in cols_to_update_names_abandoned:
@@ -543,7 +544,7 @@ def distribute_and_report():
 
                 if max_col_index_to_write_orders != -1:
                     for df_index in orders_filtered_indices:
-                        if df.loc[df_index, COL_NAMES_ORDERS['stakeholder']]:  # Only update assigned rows
+                        if df.loc[df_index, COL_NAMES_ORDERS['stakeholder']]:
                             original_sheet_row = df.loc[df_index, '_original_row_index']
                             row_values_to_write = [None] * (max_col_index_to_write_orders + 1)
                             for col_name in cols_to_update_names_orders:
@@ -621,11 +622,9 @@ def distribute_and_report():
     )
 
     if start_row_existing is not None and end_row_existing is not None:
-        # Update existing report
         logger.info(f"Existing report for {today_date_str_for_report} found. Updating range...")
         range_to_clear = f'{REPORT_SHEET_NAME}!A{start_row_existing}:Z{end_row_existing}'
         range_to_write_new = f'{REPORT_SHEET_NAME}!A{start_row_existing}'
-
         try:
             logger.info(f"Clearing range: {range_to_clear}")
             sheet.values().clear(spreadsheetId=SPREADSHEET_ID, range=range_to_clear).execute()
@@ -641,7 +640,6 @@ def distribute_and_report():
         except Exception as e:
             logger.exception("Unexpected error while updating report:")
     else:
-        # Append new report
         logger.info(f"No existing report for {today_date_str_for_report}. Appending new report...")
         start_row_for_append = 1
         try:
