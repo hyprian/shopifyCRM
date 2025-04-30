@@ -1,4 +1,7 @@
 stakeholders:
-  - Deepasha
-  - Khushi
-  - Komal
+  - name: Deepasha
+    limit: 150
+  - name: Khushi
+    limit: 200
+  - name: Komal
+    limit: 120
