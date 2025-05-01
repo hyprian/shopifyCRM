@@ -10,27 +10,20 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # --- Configuration ---
-# Main Orders Sheet
-SPREADSHEET_ID = '17x0SVsHU73z6cpshrTtGiXi9X1NfBXnjAUCw6Y0C8H4'
-ORDERS_SHEET_NAME = 'Orders'
-ORDERS_HEADER_ROW_INDEX = 1  # Orders sheet header is row 2 (0-indexed)
-ORDERS_DATA_START_ROW_INDEX = 2  # Orders sheet data starts row 3 (0-indexed)
-
-# Abandoned Orders Sheet
-ABANDONED_SPREADSHEET_ID = '14ZnB0AtEzbeDidHWL1mULPnsWaN6EtPu-qhdirKb2SM'
-ABANDONED_SHEET_NAME = 'Sheet1'
-ABANDONED_HEADER_ROW_INDEX = 0  # Abandoned sheet header is row 1 (0-indexed)
-ABANDONED_DATA_START_ROW_INDEX = 1  # Abandoned sheet data starts row 2 (0-indexed)
-
-# Report Sheet
-REPORT_SHEET_NAME = 'Stakeholder Report'
-
 # Settings File
 SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'carbon-pride-374002-2dc0cf329724.json'
 
 # Scopes required for reading and writing
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+# Sheet-specific constants
+ORDERS_SHEET_NAME = 'Orders'
+ORDERS_HEADER_ROW_INDEX = 1  # Orders sheet header is row 2 (0-indexed)
+ORDERS_DATA_START_ROW_INDEX = 2  # Orders sheet data starts row 3 (0-indexed)
+ABANDONED_SHEET_NAME = 'Sheet1'
+ABANDONED_HEADER_ROW_INDEX = 0  # Abandoned sheet header is row 1 (0-indexed)
+ABANDONED_DATA_START_ROW_INDEX = 1  # Abandoned sheet data starts row 2 (0-indexed)
 
 # Define call status priorities and report categories
 CALL_PRIORITIES = {
@@ -97,7 +90,39 @@ def load_settings(filename):
         if not settings:
             logger.warning(f"Settings file '{filename}' is empty.")
             return None
-        logger.info(f"Settings loaded successfully from '{filename}'.")
+
+        # Validate required fields
+        required_fields = [
+            ('sheets.orders_spreadsheet_id', str),
+            ('sheets.abandoned_spreadsheet_id', str),
+            ('sheets.report_sheet_name', str),
+            ('stakeholders', list)
+        ]
+        for field_path, expected_type in required_fields:
+            keys = field_path.split('.')
+            value = settings
+            for key in keys:
+                value = value.get(key)
+                if value is None:
+                    logger.error(f"Missing or invalid '{field_path}' in settings file.")
+                    return None
+            if not isinstance(value, expected_type):
+                logger.error(f"'{field_path}' must be a {expected_type.__name__}, got {type(value).__name__}.")
+                return None
+
+        # Validate stakeholders
+        for stakeholder in settings['stakeholders']:
+            if not isinstance(stakeholder, dict) or 'name' not in stakeholder or 'limit' not in stakeholder:
+                logger.error("Each stakeholder must be a dictionary with 'name' and 'limit' keys.")
+                return None
+            if not isinstance(stakeholder['name'], str) or not isinstance(stakeholder['limit'], int) or stakeholder['limit'] < 0:
+                logger.error(f"Invalid stakeholder: name must be string, limit must be non-negative integer. Got name='{stakeholder.get('name')}', limit={stakeholder.get('limit')}.")
+                return None
+
+        logger.info(f"Settings loaded successfully: Orders Spreadsheet ID={settings['sheets']['orders_spreadsheet_id']}, "
+                    f"Abandoned Spreadsheet ID={settings['sheets']['abandoned_spreadsheet_id']}, "
+                    f"Report Sheet={settings['sheets']['report_sheet_name']}, "
+                    f"{len(settings['stakeholders'])} stakeholders.")
         return settings
     except FileNotFoundError:
         logger.error(f"Error: Settings file '{filename}' not found.")
@@ -216,7 +241,7 @@ def find_existing_report_range(sheet, spreadsheet_id, report_sheet_name, today_d
         return None, None
 
 # --- Process Abandoned Orders Sheet ---
-def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments):
+def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments, abandoned_spreadsheet_id, abandoned_sheet_name):
     """Processes abandoned orders (blank, Didn't Pickup, Follow Up) with limits and returns report counts."""
     logger.info("--- Starting Abandoned Orders Processing ---")
     sheet = service.spreadsheets()
@@ -227,13 +252,13 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
 
     try:
         # Read data
-        logger.info(f"Reading data from abandoned sheet '{ABANDONED_SHEET_NAME}'...")
-        read_range = f'{ABANDONED_SHEET_NAME}!A:BH' # Keep slightly wider range
-        result = sheet.values().get(spreadsheetId=ABANDONED_SPREADSHEET_ID, range=read_range).execute()
+        logger.info(f"Reading data from abandoned sheet '{abandoned_sheet_name}'...")
+        read_range = f'{abandoned_sheet_name}!A:BH'  # Keep slightly wider range
+        result = sheet.values().get(spreadsheetId=abandoned_spreadsheet_id, range=read_range).execute()
         values = result.get('values', [])
 
         if not values:
-            logger.warning(f"No data found in abandoned sheet '{ABANDONED_SHEET_NAME}'.")
+            logger.warning(f"No data found in abandoned sheet '{abandoned_sheet_name}'.")
             return abandoned_report_counts
 
         logger.info(f"Successfully read {len(values)} rows from abandoned sheet.")
@@ -278,7 +303,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
             if col_name not in abandoned_df.columns:
                 logger.warning(f"Column '{col_name}' not found in abandoned DataFrame. Adding it as empty.")
                 abandoned_df[col_name] = ''
-            abandoned_df[col_name] = abandoned_df[col_name].astype(str) # Keep as string initially
+            abandoned_df[col_name] = abandoned_df[col_name].astype(str)  # Keep as string initially
 
         # Clean calling status
         abandoned_df[COL_NAMES_ABANDONED['calling_status']] = abandoned_df[COL_NAMES_ABANDONED['calling_status']].fillna('').astype(str).str.strip()
@@ -304,7 +329,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
 
             if assigned_stakeholder is None:
                 logger.debug(f"Abandoned row {abandoned_df.loc[df_index, '_original_row_index']} not assigned/reassigned: all stakeholders at capacity.")
-                continue # Skip to next row if no stakeholder available
+                continue  # Skip to next row if no stakeholder available
 
             assigned_count += 1
             row_data = abandoned_df.loc[df_index]
@@ -318,7 +343,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
             # --- Assign Stakeholder and Update Report Counts ---
             abandoned_df.loc[df_index, COL_NAMES_ABANDONED['stakeholder']] = assigned_stakeholder
             abandoned_report_counts[assigned_stakeholder]["Total"] += 1
-            abandoned_report_counts[assigned_stakeholder]["Abandoned"] += 1 # All processed count as Abandoned
+            abandoned_report_counts[assigned_stakeholder]["Abandoned"] += 1  # All processed count as Abandoned
 
             # --- Date Logic ---
             if call_status == '':
@@ -363,15 +388,15 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
                     abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = original_date3_val
 
             else:
-                 logger.error(f"Abandoned Row {original_sheet_row} has unexpected status '{call_status}' after filtering. Assigned to {assigned_stakeholder} but date logic skipped.")
-                 # Ensure DataFrame reflects original dates if skipped
-                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = original_date1_val
-                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = original_date2_val
-                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = original_date3_val
+                logger.error(f"Abandoned Row {original_sheet_row} has unexpected status '{call_status}' after filtering. Assigned to {assigned_stakeholder} but date logic skipped.")
+                # Ensure DataFrame reflects original dates if skipped
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = original_date1_val
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = original_date2_val
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = original_date3_val
 
         logger.info(f"Stakeholders assigned/reassigned to {assigned_count} abandoned rows.")
 
-        # Prepare batch update (logic remains the same as previous version)
+        # Prepare batch update
         logger.info("Preparing batch update for Abandoned sheet...")
         abandoned_updates = []
         cols_to_update_names_abandoned = [
@@ -408,8 +433,8 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
                         row_values_to_write[col_idx] = value_to_write if pd.notna(value_to_write) else ''
 
                 if any(val is not None for val in row_values_to_write):
-                     abandoned_updates.append({
-                        'range': f'{ABANDONED_SHEET_NAME}!A{original_sheet_row}:{col_index_to_a1(max_col_index_to_write_abandoned)}{original_sheet_row}',
+                    abandoned_updates.append({
+                        'range': f'{abandoned_sheet_name}!A{original_sheet_row}:{col_index_to_a1(max_col_index_to_write_abandoned)}{original_sheet_row}',
                         'values': [row_values_to_write]
                     })
 
@@ -417,13 +442,13 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
         else:
             logger.warning("None of the target update columns (Stakeholder, Date 1/2/3) were found in the abandoned sheet header. No updates prepared.")
 
-        # Execute batch update (logic remains the same)
+        # Execute batch update
         if abandoned_updates:
             logger.info("Executing batch update to Abandoned sheet...")
             body = {'value_input_option': 'RAW', 'data': abandoned_updates}
             try:
                 result = sheet.values().batchUpdate(
-                    spreadsheetId=ABANDONED_SPREADSHEET_ID, body=body).execute()
+                    spreadsheetId=abandoned_spreadsheet_id, body=body).execute()
                 logger.info(f"Abandoned sheet batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
             except HttpError as e:
                 logger.error(f"API Error during abandoned sheet batch update: {e}")
@@ -440,17 +465,21 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
     logger.info("--- Finished Abandoned Orders Processing ---")
     return abandoned_report_counts
 
-
 # --- Main Processing Function ---
 def distribute_and_report():
     logger.info("Starting script.")
 
     settings = load_settings(SETTINGS_FILE)
     if not settings or 'stakeholders' not in settings:
-        logger.error("Failed to load stakeholders. Aborting.")
+        logger.error("Failed to load settings. Aborting.")
         return
 
+    # Extract configuration
+    ORDERS_SPREADSHEET_ID = settings['sheets']['orders_spreadsheet_id']
+    ABANDONED_SPREADSHEET_ID = settings['sheets']['abandoned_spreadsheet_id']
+    REPORT_SHEET_NAME = settings['sheets']['report_sheet_name']
     stakeholder_list = settings['stakeholders']
+    
     if not stakeholder_list:
         logger.error("Stakeholder list is empty. Aborting.")
         return
@@ -486,7 +515,7 @@ def distribute_and_report():
         # Read data
         logger.info(f"Reading data from '{ORDERS_SHEET_NAME}'...")
         read_range = f'{ORDERS_SHEET_NAME}!A:BD'
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=read_range).execute()
+        result = sheet.values().get(spreadsheetId=ORDERS_SPREADSHEET_ID, range=read_range).execute()
         values = result.get('values', [])
 
         if not values:
@@ -637,7 +666,7 @@ def distribute_and_report():
                     body = {'value_input_option': 'RAW', 'data': orders_updates}
                     try:
                         result = sheet.values().batchUpdate(
-                            spreadsheetId=SPREADSHEET_ID, body=body).execute()
+                            spreadsheetId=ORDERS_SPREADSHEET_ID, body=body).execute()
                         logger.info(f"Orders sheet batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
                     except HttpError as e:
                         logger.error(f"API Error during Orders sheet batch update: {e}")
@@ -654,7 +683,7 @@ def distribute_and_report():
         logger.exception("Unexpected error during main Orders execution:")
 
     # --- Process Abandoned Orders Sheet ---
-    abandoned_report_counts = distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments)
+    abandoned_report_counts = distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments, ABANDONED_SPREADSHEET_ID, ABANDONED_SHEET_NAME)
 
     # --- Combine Report Counts ---
     logger.info("Combining report counts from Orders and Abandoned sheets...")
@@ -690,7 +719,7 @@ def distribute_and_report():
     # --- Write Report ---
     logger.info(f"Writing report to '{REPORT_SHEET_NAME}'...")
     start_row_existing, end_row_existing = find_existing_report_range(
-        sheet, SPREADSHEET_ID, REPORT_SHEET_NAME, today_date_str_for_report
+        sheet, ORDERS_SPREADSHEET_ID, REPORT_SHEET_NAME, today_date_str_for_report
     )
 
     if start_row_existing is not None and end_row_existing is not None:
@@ -699,12 +728,12 @@ def distribute_and_report():
         range_to_write_new = f'{REPORT_SHEET_NAME}!A{start_row_existing}'
         try:
             logger.info(f"Clearing range: {range_to_clear}")
-            sheet.values().clear(spreadsheetId=SPREADSHEET_ID, range=range_to_clear).execute()
+            sheet.values().clear(spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_clear).execute()
             logger.info("Cleared old report data.")
             logger.info(f"Writing new report data to range: {range_to_write_new}")
             body = {'values': formatted_report_values}
             result = sheet.values().update(
-                spreadsheetId=SPREADSHEET_ID, range=range_to_write_new,
+                spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_write_new,
                 valueInputOption='RAW', body=body).execute()
             logger.info(f"Report updated. {result.get('updatedCells', 'N/A')} cells updated.")
         except HttpError as e:
@@ -715,7 +744,7 @@ def distribute_and_report():
         logger.info(f"No existing report for {today_date_str_for_report}. Appending new report...")
         start_row_for_append = 1
         try:
-            result_existing_report = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A:A').execute()
+            result_existing_report = sheet.values().get(spreadsheetId=ORDERS_SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A:A').execute()
             existing_values = result_existing_report.get('values', [])
             if existing_values:
                 start_row_for_append = len(existing_values) + 1
@@ -725,7 +754,7 @@ def distribute_and_report():
                 logger.warning(f"Sheet '{REPORT_SHEET_NAME}' not found. Creating it.")
                 try:
                     body = {'requests': [{'addSheet': {'properties': {'title': REPORT_SHEET_NAME}}}]}
-                    sheet.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+                    sheet.batchUpdate(spreadsheetId=ORDERS_SPREADSHEET_ID, body=body).execute()
                     logger.info(f"Created sheet '{REPORT_SHEET_NAME}'. Report starts at row {start_row_for_append}.")
                 except Exception as create_err:
                     logger.error(f"Error creating sheet '{REPORT_SHEET_NAME}': {create_err}")
@@ -743,7 +772,7 @@ def distribute_and_report():
             logger.info(f"Writing report data to range '{range_to_write_report}'.")
             try:
                 result = sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID, range=range_to_write_report,
+                    spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_write_report,
                     valueInputOption='RAW', body=body).execute()
                 logger.info(f"Report written. {result.get('updatedCells', 'N/A')} cells updated.")
             except HttpError as e:

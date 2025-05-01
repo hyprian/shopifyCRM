@@ -1,7 +1,14 @@
+# settings.yaml
+sheets:
+  orders_spreadsheet_id: '17x0SVsHU73z6cpshrTtGiXi9X1NfBXnjAUCw6Y0C8H4'
+  abandoned_spreadsheet_id: '14ZnB0AtEzbeDidHWL1mULPnsWaN6EtPu-qhdirKb2SM'
+  report_sheet_name: 'Stakeholder Report'
+files:
+  master_csv: 'master_report_20250401_to_20250430.csv'
 stakeholders:
   - name: Deepasha
-    limit: 40
+    limit: 100
   - name: Khushi
-    limit: 70
+    limit: 100
   - name: Komal
-    limit: 90
+    limit: 100

@@ -3,25 +3,23 @@ import os.path
 import pandas as pd
 import logging
 import sys
+import yaml
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # --- Configuration ---
-# Orders Sheet
-SPREADSHEET_ID = '17x0SVsHU73z6cpshrTtGiXi9X1NfBXnjAUCw6Y0C8H4'
-ORDERS_SHEET_NAME = 'Orders'
-ORDERS_HEADER_ROW_INDEX = 1  # Orders sheet header is row 2 (0-indexed)
-ORDERS_DATA_START_ROW_INDEX = 2  # Orders sheet data starts row 3 (0-indexed)
-
-# CSV File
-MASTER_CSV_FILE = 'master_report_20250401_to_20250430.csv'
-
-# Service Account File
+# Settings File
+SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'carbon-pride-374002-2dc0cf329724.json'
 
 # Scopes for Google Sheets API
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+# Sheet-specific constants
+ORDERS_SHEET_NAME = 'Orders'
+ORDERS_HEADER_ROW_INDEX = 1  # Orders sheet header is row 2 (0-indexed)
+ORDERS_DATA_START_ROW_INDEX = 2  # Orders sheet data starts row 3 (0-indexed)
 
 # Status Mapping (CSV status to Orders sheet dropdown values)
 STATUS_MAPPING = {
@@ -52,6 +50,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Load Settings Function ---
+def load_settings(filename):
+    """Loads configuration from a YAML file."""
+    logger.info(f"Loading settings from '{filename}'...")
+    try:
+        with open(filename, 'r') as f:
+            settings = yaml.safe_load(f)
+        if not settings:
+            logger.warning(f"Settings file '{filename}' is empty.")
+            return None
+
+        # Validate required fields
+        required_fields = [
+            ('sheets.orders_spreadsheet_id', str),
+            ('files.master_csv', str)
+        ]
+        for field_path, expected_type in required_fields:
+            keys = field_path.split('.')
+            value = settings
+            for key in keys:
+                value = value.get(key)
+                if value is None:
+                    logger.error(f"Missing or invalid '{field_path}' in settings file.")
+                    return None
+            if not isinstance(value, expected_type):
+                logger.error(f"'{field_path}' must be a {expected_type.__name__}, got {type(value).__name__}.")
+                return None
+
+        logger.info(f"Settings loaded successfully: Orders Spreadsheet ID={settings['sheets']['orders_spreadsheet_id']}, "
+                    f"Master CSV={settings['files']['master_csv']}.")
+        return settings
+    except FileNotFoundError:
+        logger.error(f"Error: Settings file '{filename}' not found.")
+        return None
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing settings file '{filename}': {e}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred loading settings: {e}")
+        return None
+
 # --- Authentication ---
 def authenticate_google_sheets():
     """Authenticates using a service account key file."""
@@ -81,13 +120,13 @@ def authenticate_google_sheets():
         return None
 
 # --- Read and Filter Orders Sheet ---
-def read_orders_sheet(service):
+def read_orders_sheet(service, spreadsheet_id):
     """Reads the Orders sheet and filters rows with Call-status 'Confirmed' or 'Prepaid'."""
-    logger.info(f"Reading data from '{ORDERS_SHEET_NAME}' (ID: {SPREADSHEET_ID})...")
+    logger.info(f"Reading data from '{ORDERS_SHEET_NAME}' (ID: {spreadsheet_id})...")
     sheet = service.spreadsheets()
     read_range = f'{ORDERS_SHEET_NAME}!A:AZ'  # Wide range to ensure all columns are captured
     try:
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=read_range).execute()
+        result = sheet.values().get(spreadsheetId=spreadsheet_id, range=read_range).execute()
         values = result.get('values', [])
 
         if not values:
@@ -149,12 +188,12 @@ def read_orders_sheet(service):
         return None
 
 # --- Read Master CSV ---
-def read_master_csv():
+def read_master_csv(master_csv_file):
     """Reads the master_report CSV file."""
-    logger.info(f"Reading CSV file '{MASTER_CSV_FILE}'...")
+    logger.info(f"Reading CSV file '{master_csv_file}'...")
     try:
-        df = pd.read_csv(MASTER_CSV_FILE, dtype=str, keep_default_na=False)
-        logger.info(f"Read {len(df)} rows from '{MASTER_CSV_FILE}'.")
+        df = pd.read_csv(master_csv_file, dtype=str, keep_default_na=False)
+        logger.info(f"Read {len(df)} rows from '{master_csv_file}'.")
 
         # Ensure required columns exist
         required_cols = ['Order Name', 'Order Status']
@@ -172,7 +211,7 @@ def read_master_csv():
         return filtered_df
 
     except FileNotFoundError:
-        logger.error(f"Error: CSV file '{MASTER_CSV_FILE}' not found.")
+        logger.error(f"Error: CSV file '{master_csv_file}' not found.")
         return None
     except Exception as e:
         logger.exception(f"Unexpected error while reading CSV file:")
@@ -229,7 +268,7 @@ def prepare_status_updates(orders_df, csv_df):
     return updates
 
 # --- Execute Batch Update ---
-def execute_batch_update(service, updates, orders_df):
+def execute_batch_update(service, updates, orders_df, spreadsheet_id):
     """Executes batch update to Orders sheet for Order Status."""
     if not updates:
         logger.info("No updates to apply to Orders sheet.")
@@ -241,7 +280,7 @@ def execute_batch_update(service, updates, orders_df):
     # Find the Order Status column index
     try:
         header_range = f'{ORDERS_SHEET_NAME}!A{ORDERS_HEADER_ROW_INDEX + 1}:AZ{ORDERS_HEADER_ROW_INDEX + 1}'
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=header_range).execute()
+        result = sheet.values().get(spreadsheetId=spreadsheet_id, range=header_range).execute()
         header = result.get('values', [[]])[0]
         header = [str(h).strip() if h is not None else '' for h in header]
         order_status_col = COL_NAMES_ORDERS['order_status']
@@ -274,7 +313,7 @@ def execute_batch_update(service, updates, orders_df):
     logger.info("Executing batch update to Orders sheet...")
     body = {'value_input_option': 'RAW', 'data': batch_updates}
     try:
-        result = sheet.values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+        result = sheet.values().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
         logger.info(f"Orders sheet batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
     except HttpError as e:
         logger.error(f"Google Sheets API Error during batch update: {e}")
@@ -286,6 +325,16 @@ def update_order_status():
     """Main function to update Order Status in Orders sheet based on master CSV."""
     logger.info("Starting Order Status Update script.")
 
+    # Load settings
+    settings = load_settings(SETTINGS_FILE)
+    if not settings:
+        logger.error("Failed to load settings. Aborting script.")
+        return
+
+    # Extract configuration
+    SPREADSHEET_ID = settings['sheets']['orders_spreadsheet_id']
+    MASTER_CSV_FILE = settings['files']['master_csv']
+
     # Authenticate
     service = authenticate_google_sheets()
     if not service:
@@ -293,13 +342,13 @@ def update_order_status():
         return
 
     # Read Orders sheet
-    orders_df = read_orders_sheet(service)
+    orders_df = read_orders_sheet(service, SPREADSHEET_ID)
     if orders_df is None:
         logger.error("Failed to read Orders sheet. Aborting script.")
         return
 
     # Read Master CSV
-    csv_df = read_master_csv()
+    csv_df = read_master_csv(MASTER_CSV_FILE)
     if csv_df is None:
         logger.error("Failed to read master CSV. Aborting script.")
         return
@@ -311,7 +360,7 @@ def update_order_status():
         return
 
     # Execute batch update
-    execute_batch_update(service, updates, orders_df)
+    execute_batch_update(service, updates, orders_df, SPREADSHEET_ID)
 
     logger.info("Order Status Update script finished execution.")
 
