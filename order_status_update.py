@@ -1,3 +1,4 @@
+# order_status_update.py
 import os.path
 import pandas as pd
 import logging
@@ -26,16 +27,17 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 STATUS_MAPPING = {
     'DELIVERED': 'Delivered',
     'RTO': 'RTO',
+    'RTO_INITIATED': 'RTO',
     'OUT_FOR_DELIVERY': 'Out for delivery',
-    'PENDING': 'Pending To Be Dispatch',
-    'SHIPPED': 'In-transit'
+    'SHIPPED': 'In-transit',
+    'PACKED': 'Pending pick up'
 }
 
-# Column Names in Orders Sheet (updated to match exact header names)
+# Column Names in Orders Sheet
 COL_NAMES_ORDERS = {
     'name': 'Name',  # e.g., #1448
     'call_status': 'Call-status',
-    'order_status': 'order status'  # Changed to match lowercase header in sheet
+    'order_status': 'order status'
 }
 
 # --- Logging Setup ---

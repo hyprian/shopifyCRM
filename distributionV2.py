@@ -1,3 +1,4 @@
+# distributionV2.py
 import os.path
 import datetime
 import yaml
@@ -216,18 +217,18 @@ def find_existing_report_range(sheet, spreadsheet_id, report_sheet_name, today_d
 
 # --- Process Abandoned Orders Sheet ---
 def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments):
-    """Processes abandoned orders with limits and returns report counts."""
+    """Processes abandoned orders (blank, Didn't Pickup, Follow Up) with limits and returns report counts."""
     logger.info("--- Starting Abandoned Orders Processing ---")
     sheet = service.spreadsheets()
     today_date_str_for_sheet = datetime.date.today().strftime("%d-%b-%Y")
-    
+
     # Initialize report counts for abandoned orders
     abandoned_report_counts = {stakeholder['name']: {"Total": 0, "Abandoned": 0} for stakeholder in stakeholder_list}
 
     try:
         # Read data
         logger.info(f"Reading data from abandoned sheet '{ABANDONED_SHEET_NAME}'...")
-        read_range = f'{ABANDONED_SHEET_NAME}!A:BF'
+        read_range = f'{ABANDONED_SHEET_NAME}!A:BH' # Keep slightly wider range
         result = sheet.values().get(spreadsheetId=ABANDONED_SPREADSHEET_ID, range=read_range).execute()
         values = result.get('values', [])
 
@@ -269,52 +270,115 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
         cols_needed = [
             COL_NAMES_ABANDONED['calling_status'],
             COL_NAMES_ABANDONED['stakeholder'],
-            COL_NAMES_ABANDONED['date_col_1']
+            COL_NAMES_ABANDONED['date_col_1'],
+            COL_NAMES_ABANDONED['date_col_2'],
+            COL_NAMES_ABANDONED['date_col_3']
         ]
         for col_name in cols_needed:
             if col_name not in abandoned_df.columns:
                 logger.warning(f"Column '{col_name}' not found in abandoned DataFrame. Adding it as empty.")
                 abandoned_df[col_name] = ''
-            abandoned_df[col_name] = abandoned_df[col_name].astype(str)
+            abandoned_df[col_name] = abandoned_df[col_name].astype(str) # Keep as string initially
 
         # Clean calling status
         abandoned_df[COL_NAMES_ABANDONED['calling_status']] = abandoned_df[COL_NAMES_ABANDONED['calling_status']].fillna('').astype(str).str.strip()
 
-        # Filter rows where Call Status is blank
-        logger.info("Filtering abandoned rows with blank Call Status...")
-        exclude_statuses = ['Confirmed', 'Cancel', 'Whatsapp', "Didn't Pickup", 'Follow Up']
-        abandoned_to_process_df = abandoned_df[abandoned_df[COL_NAMES_ABANDONED['calling_status']] == ''].copy()
+        # Filter rows where Call Status is blank, "Didn't Pickup", or "Follow Up"
+        statuses_to_process = ['', "Didn't Pickup", "Follow Up"]
+        logger.info(f"Filtering abandoned rows with Call Status in {statuses_to_process}...")
+        abandoned_to_process_df = abandoned_df[abandoned_df[COL_NAMES_ABANDONED['calling_status']].isin(statuses_to_process)].copy()
         abandoned_filtered_indices = abandoned_to_process_df.index.tolist()
 
-        logger.info(f"Found {len(abandoned_filtered_indices)} abandoned rows with blank Call Status.")
+        logger.info(f"Found {len(abandoned_filtered_indices)} abandoned rows matching criteria: {statuses_to_process}.")
 
         if not abandoned_filtered_indices:
-            logger.info("No abandoned rows matched filter criteria. Skipping assignments.")
+            logger.info("No abandoned rows matched filter criteria for assignment/reassignment. Skipping.")
             return abandoned_report_counts
 
-        # Assign stakeholders with limits
-        logger.info(f"Assigning stakeholders to {len(abandoned_filtered_indices)} abandoned rows with limits...")
+        # Assign stakeholders with limits and apply date logic
+        logger.info(f"Assigning/Reassigning stakeholders to {len(abandoned_filtered_indices)} abandoned rows with limits...")
         current_index = 0
+        assigned_count = 0
         for df_index in abandoned_filtered_indices:
             assigned_stakeholder, current_index = assign_stakeholder_with_limits(current_index, stakeholder_list, stakeholder_assignments)
+
             if assigned_stakeholder is None:
-                logger.debug(f"Abandoned row {abandoned_df.loc[df_index, '_original_row_index']} not assigned: all stakeholders at capacity.")
-                continue
+                logger.debug(f"Abandoned row {abandoned_df.loc[df_index, '_original_row_index']} not assigned/reassigned: all stakeholders at capacity.")
+                continue # Skip to next row if no stakeholder available
+
+            assigned_count += 1
             row_data = abandoned_df.loc[df_index]
+            original_sheet_row = row_data['_original_row_index']
+            call_status = row_data.get(COL_NAMES_ABANDONED['calling_status'], '').strip()
+            # Get original date values *before* potential updates
+            original_date1_val = str(row_data.get(COL_NAMES_ABANDONED['date_col_1'], '')).strip()
+            original_date2_val = str(row_data.get(COL_NAMES_ABANDONED['date_col_2'], '')).strip()
+            original_date3_val = str(row_data.get(COL_NAMES_ABANDONED['date_col_3'], '')).strip()
+
+            # --- Assign Stakeholder and Update Report Counts ---
             abandoned_df.loc[df_index, COL_NAMES_ABANDONED['stakeholder']] = assigned_stakeholder
-            abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = today_date_str_for_sheet
             abandoned_report_counts[assigned_stakeholder]["Total"] += 1
-            abandoned_report_counts[assigned_stakeholder]["Abandoned"] += 1
-            logger.debug(f"Abandoned Row {row_data['_original_row_index']}: Assigned to {assigned_stakeholder}, set Date 1 to {today_date_str_for_sheet}.")
+            abandoned_report_counts[assigned_stakeholder]["Abandoned"] += 1 # All processed count as Abandoned
 
-        logger.info(f"Assigned stakeholders to {sum(c['Total'] for c in abandoned_report_counts.values())} abandoned rows.")
+            # --- Date Logic ---
+            if call_status == '':
+                # For blank status, ALWAYS update Date 1 to today's date.
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = today_date_str_for_sheet
+                # Clear Date 2 and Date 3 just in case they had spurious data for a blank status row
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = ''
+                abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = ''
 
-        # Prepare batch update
+                # Log appropriately based on whether Date 1 was overwritten
+                if not original_date1_val:
+                    logger.debug(f"Abandoned Row {original_sheet_row} (Blank Status): Assigned to {assigned_stakeholder}, set Date 1 to {today_date_str_for_sheet}.")
+                else:
+                    logger.debug(f"Abandoned Row {original_sheet_row} (Blank Status, existing Date 1 '{original_date1_val}'): Assigned to {assigned_stakeholder}, **overwrote** Date 1 with {today_date_str_for_sheet}.")
+
+            elif call_status in ["Didn't Pickup", "Follow Up"]:
+                # This is a reassignment for follow-up (multi-date logic)
+                if not original_date1_val:
+                    # If Date 1 is somehow blank, fill it first (unlikely flow)
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = today_date_str_for_sheet
+                    # Clear Date 2/3 if we are filling Date 1 here
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = ''
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = ''
+                    logger.warning(f"Abandoned Row {original_sheet_row} ('{call_status}') had no Date 1. Set Date 1 to {today_date_str_for_sheet}. Assigned to {assigned_stakeholder}.")
+                elif not original_date2_val:
+                    # Date 1 exists, fill Date 2 if empty
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = today_date_str_for_sheet
+                    # Keep Date 1 as is, clear Date 3
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = ''
+                    logger.debug(f"Abandoned Row {original_sheet_row} ('{call_status}', 2nd attempt): Reassigned to {assigned_stakeholder}, set Date 2 to {today_date_str_for_sheet}.")
+                elif not original_date3_val:
+                    # Date 1 and 2 exist, fill Date 3 if empty
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = today_date_str_for_sheet
+                    # Keep Date 1 and 2 as is
+                    logger.debug(f"Abandoned Row {original_sheet_row} ('{call_status}', 3rd attempt): Reassigned to {assigned_stakeholder}, set Date 3 to {today_date_str_for_sheet}.")
+                else:
+                    # All 3 dates already filled
+                    logger.debug(f"Abandoned Row {original_sheet_row} ('{call_status}'): Already has 3 dates filled. Reassigned to {assigned_stakeholder}, but no date column updated.")
+                    # Ensure DataFrame reflects original dates if no update happened
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = original_date1_val
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = original_date2_val
+                    abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = original_date3_val
+
+            else:
+                 logger.error(f"Abandoned Row {original_sheet_row} has unexpected status '{call_status}' after filtering. Assigned to {assigned_stakeholder} but date logic skipped.")
+                 # Ensure DataFrame reflects original dates if skipped
+                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_1']] = original_date1_val
+                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_2']] = original_date2_val
+                 abandoned_df.loc[df_index, COL_NAMES_ABANDONED['date_col_3']] = original_date3_val
+
+        logger.info(f"Stakeholders assigned/reassigned to {assigned_count} abandoned rows.")
+
+        # Prepare batch update (logic remains the same as previous version)
         logger.info("Preparing batch update for Abandoned sheet...")
         abandoned_updates = []
         cols_to_update_names_abandoned = [
             COL_NAMES_ABANDONED['stakeholder'],
-            COL_NAMES_ABANDONED['date_col_1']
+            COL_NAMES_ABANDONED['date_col_1'],
+            COL_NAMES_ABANDONED['date_col_2'],
+            COL_NAMES_ABANDONED['date_col_3']
         ]
         sheet_col_indices_abandoned = {}
         max_col_index_to_write_abandoned = -1
@@ -330,23 +394,30 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
                 sheet_col_indices_abandoned[col_name] = -1
 
         if max_col_index_to_write_abandoned != -1:
-            for df_index in abandoned_filtered_indices:
-                if abandoned_df.loc[df_index, COL_NAMES_ABANDONED['stakeholder']]:
-                    original_sheet_row = abandoned_df.loc[df_index, '_original_row_index']
-                    row_values_to_write = [None] * (max_col_index_to_write_abandoned + 1)
-                    for col_name in cols_to_update_names_abandoned:
-                        if sheet_col_indices_abandoned.get(col_name, -1) != -1:
-                            row_values_to_write[sheet_col_indices_abandoned[col_name]] = abandoned_df.loc[df_index, col_name]
-                    abandoned_updates.append({
-                        'range': f'{ABANDONED_SHEET_NAME}!A{original_sheet_row}',
+            assigned_indices = [idx for idx in abandoned_filtered_indices if not pd.isna(abandoned_df.loc[idx, COL_NAMES_ABANDONED['stakeholder']]) and abandoned_df.loc[idx, COL_NAMES_ABANDONED['stakeholder']] != '']
+
+            for df_index in assigned_indices:
+                original_sheet_row = abandoned_df.loc[df_index, '_original_row_index']
+                row_values_to_write = [None] * (max_col_index_to_write_abandoned + 1)
+
+                for col_name in cols_to_update_names_abandoned:
+                    col_idx = sheet_col_indices_abandoned.get(col_name, -1)
+                    if col_idx != -1:
+                        value_to_write = abandoned_df.loc[df_index, col_name]
+                        # Write blank string for empty/None values to clear cells if needed
+                        row_values_to_write[col_idx] = value_to_write if pd.notna(value_to_write) else ''
+
+                if any(val is not None for val in row_values_to_write):
+                     abandoned_updates.append({
+                        'range': f'{ABANDONED_SHEET_NAME}!A{original_sheet_row}:{col_index_to_a1(max_col_index_to_write_abandoned)}{original_sheet_row}',
                         'values': [row_values_to_write]
                     })
 
             logger.info(f"Prepared {len(abandoned_updates)} row updates for Abandoned sheet batch write.")
         else:
-            logger.warning("No writeable columns found in abandoned header. No updates prepared.")
+            logger.warning("None of the target update columns (Stakeholder, Date 1/2/3) were found in the abandoned sheet header. No updates prepared.")
 
-        # Execute batch update
+        # Execute batch update (logic remains the same)
         if abandoned_updates:
             logger.info("Executing batch update to Abandoned sheet...")
             body = {'value_input_option': 'RAW', 'data': abandoned_updates}
@@ -368,6 +439,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
 
     logger.info("--- Finished Abandoned Orders Processing ---")
     return abandoned_report_counts
+
 
 # --- Main Processing Function ---
 def distribute_and_report():
