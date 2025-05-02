@@ -1,6 +1,7 @@
+streamlit
 pandas
-PyYAML
-google-api-python-client
+pyyaml
 google-auth
 google-auth-oauthlib
-streamlit
+google-auth-httplib2
+google-api-python-client
