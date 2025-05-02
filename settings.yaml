@@ -6,8 +6,8 @@ files:
   master_csv: shopify_report_20250401_to_20250430.csv
 stakeholders:
 - name: Deepasha
-  limit: 102
+  limit: 80
 - name: Khushi
-  limit: 100
+  limit: 80
 - name: Komal
-  limit: 100
+  limit: 80
