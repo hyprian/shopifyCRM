@@ -12,7 +12,7 @@ from googleapiclient.errors import HttpError
 # --- Configuration ---
 # Settings File
 SETTINGS_FILE = 'settings.yaml'
-SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-f33960650e7b.json'
+SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-855f3bdefd90.json'
 
 # Scopes required for reading and writing
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']

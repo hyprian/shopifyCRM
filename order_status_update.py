@@ -11,7 +11,7 @@ from googleapiclient.errors import HttpError
 # --- Configuration ---
 # Settings File
 SETTINGS_FILE = 'settings.yaml'
-SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-a4cca7a0658c.json'
+SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-855f3bdefd90.json'
 
 # Scopes for Google Sheets API
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
