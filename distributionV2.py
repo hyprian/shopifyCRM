@@ -59,7 +59,7 @@ COL_NAMES_ORDERS = {
 }
 
 COL_NAMES_ABANDONED = {
-    'calling_status': 'Call Status',
+    'calling_status': 'Call status',
     'stakeholder': 'Stake Holder',
     'date_col_1': 'Date 1',
     'date_col_2': 'Date 2',
