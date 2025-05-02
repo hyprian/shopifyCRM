@@ -800,6 +800,7 @@ import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 
 # --- Configuration ---
 SETTINGS_FILE = 'settings.yaml'
@@ -956,11 +957,16 @@ def authenticate_google_sheets():
     try:
         if 'GOOGLE_CREDENTIALS' in st.secrets:
             logger.info("Loading credentials from Streamlit secrets...")
+            creds_info = st.secrets["GOOGLE_CREDENTIALS"].to_dict()
+            logger.debug(f"Streamlit secrets credentials keys: {list(creds_info.keys())}")
             creds = service_account.Credentials.from_service_account_info(
-                st.secrets["GOOGLE_CREDENTIALS"].to_dict(), scopes=SCOPES)
+                creds_info, scopes=SCOPES)
             logger.info("Credentials loaded successfully from secrets.")
     except (KeyError, FileNotFoundError, st.errors.StreamlitAPIException) as e:
         logger.info(f"Streamlit secrets not found or inaccessible: {e}. Falling back to local service account file...")
+    except Exception as e:
+        logger.error(f"Error parsing Streamlit secrets credentials: {e}")
+        return None
 
     # Fallback to local service account file if secrets are unavailable
     if creds is None:
@@ -984,6 +990,10 @@ def authenticate_google_sheets():
     try:
         service = build('sheets', 'v4', credentials=creds)
         return service
+    except RefreshError as e:
+        logger.error(f"Authentication failed due to invalid credentials: {e}")
+        logger.error("Ensure the service account key is valid and not revoked. If using Streamlit secrets, verify the private_key format.")
+        return None
     except HttpError as e:
         logger.error(f"Google Sheets API Error during service build: {e}")
         logger.error("Ensure the service account has Editor access to the spreadsheet.")
