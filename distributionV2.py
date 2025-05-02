@@ -789,7 +789,6 @@
 #     distribute_and_report()
 
 
-
 import os.path
 import datetime
 import yaml
@@ -803,7 +802,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # --- Configuration ---
-# Settings File
 SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-855f3bdefd90.json'
 
@@ -952,25 +950,34 @@ def assign_stakeholder_with_limits(current_index, stakeholder_list, stakeholder_
 
 # --- Authentication ---
 def authenticate_google_sheets():
-    """Authenticates using a service account key from file or Streamlit secrets."""
+    """Authenticates using Streamlit secrets or local service account file."""
     creds = None
+    # Check if running in Streamlit Cloud (or secrets are configured)
     try:
-        # Check if running on Streamlit Cloud with secrets
-        if "GOOGLE_CREDENTIALS" in st.secrets:
+        if 'GOOGLE_CREDENTIALS' in st.secrets:
             logger.info("Loading credentials from Streamlit secrets...")
             creds = service_account.Credentials.from_service_account_info(
                 st.secrets["GOOGLE_CREDENTIALS"].to_dict(), scopes=SCOPES)
-        else:
-            # Local environment: use service account file
-            logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
-            if not os.path.exists(SERVICE_ACCOUNT_FILE):
-                logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
-                return None
+            logger.info("Credentials loaded successfully from secrets.")
+    except (KeyError, FileNotFoundError, st.errors.StreamlitAPIException) as e:
+        logger.info(f"Streamlit secrets not found or inaccessible: {e}. Falling back to local service account file...")
+
+    # Fallback to local service account file if secrets are unavailable
+    if creds is None:
+        logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
+        try:
             creds = service_account.Credentials.from_service_account_file(
                 SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        logger.info("Credentials loaded successfully.")
-    except Exception as e:
-        logger.error(f"Error loading service account credentials: {e}")
+            logger.info("Credentials loaded successfully from local file.")
+        except FileNotFoundError:
+            logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
+            return None
+        except Exception as e:
+            logger.error(f"Error loading service account credentials from file: {e}")
+            return None
+
+    if creds is None:
+        logger.error("No valid credentials loaded. Authentication failed.")
         return None
 
     logger.info("Building Google Sheets API service...")
