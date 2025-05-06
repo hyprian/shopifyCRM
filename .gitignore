@@ -1,5 +1,4 @@
 # .gitignore
-*.json
 *.log
 *.txt
 __pycache__/
