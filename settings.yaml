@@ -1,9 +1,12 @@
 sheets:
-  orders_spreadsheet_id: 17x0SVsHU73z6cpshrTtGiXi9X1NfBXnjAUCw6Y0C8H4
-  abandoned_spreadsheet_id: 1dtHUylkMcsLb_T6QWCVVoT0a8IcLNMI3AtVtMya_Vb8
+  orders_spreadsheet_id: 1dRI9Vdubb2CVEG15ygaBku2KSbwf_xsjBJMro7xOq0A
+  abandoned_spreadsheet_id: 1EW_rmtdf035nsLsKcd6MnVg47HLOTtpF1HpgidfwgEo
   report_sheet_name: Stakeholder Report
   performance_report_sheet_name: 'Performance Reports' # For performance report
-  summary_sheet_name: 'Summary' 
+  summary_sheet_name: 'Summary'
+processing_controls:  
+  process_orders_sheet: true  
+  process_abandoned_sheet: false 
 files:
   master_csv: master_report_20250401_to_20250502.csv
 stakeholders:

@@ -99,16 +99,24 @@ def load_settings(filename):
             ('sheets.orders_spreadsheet_id', str),
             ('sheets.abandoned_spreadsheet_id', str),
             ('sheets.report_sheet_name', str),
+            ('processing_controls.process_orders_sheet', bool),      # New
+            ('processing_controls.process_abandoned_sheet', bool), # New
             ('stakeholders', list)
         ]
         for field_path, expected_type in required_fields:
             keys = field_path.split('.')
             value = settings
+            is_present = True
             for key in keys:
-                value = value.get(key)
-                if value is None:
-                    logger.error(f"Missing or invalid '{field_path}' in settings file.")
-                    return None
+                if isinstance(value, dict) and key in value:
+                    value = value.get(key)
+                else:
+                    is_present = False
+                    break
+            
+            if not is_present or value is None: # Check if present before type check
+                logger.error(f"Missing or invalid '{field_path}' in settings file.")
+                return None
             if not isinstance(value, expected_type):
                 logger.error(f"'{field_path}' must be a {expected_type.__name__}, got {type(value).__name__}.")
                 return None
@@ -125,6 +133,8 @@ def load_settings(filename):
         logger.info(f"Settings loaded successfully: Orders Spreadsheet ID={settings['sheets']['orders_spreadsheet_id']}, "
                     f"Abandoned Spreadsheet ID={settings['sheets']['abandoned_spreadsheet_id']}, "
                     f"Report Sheet={settings['sheets']['report_sheet_name']}, "
+                    f"Process Orders={settings['processing_controls']['process_orders_sheet']}, " # New log
+                    f"Process Abandoned={settings['processing_controls']['process_abandoned_sheet']}, " # New log
                     f"{len(settings['stakeholders'])} stakeholders.")
         return settings
     except FileNotFoundError:
@@ -136,6 +146,7 @@ def load_settings(filename):
     except Exception as e:
         logger.error(f"An unexpected error occurred loading settings: {e}")
         return None
+    
 
 # --- Helper Functions ---
 def col_index_to_a1(index):
@@ -325,7 +336,7 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
                 abandoned_df[col_name] = abandoned_df[col_name].astype(str)
 
         abandoned_df[COL_NAMES_ABANDONED['calling_status']] = abandoned_df[COL_NAMES_ABANDONED['calling_status']].fillna('').astype(str).str.strip()
-        statuses_to_process = ['', "Didn't Pickup", "Follow Up"]
+        statuses_to_process = ['', "Didn't Pickup", "Follow up"]
         abandoned_to_process_df = abandoned_df[abandoned_df[COL_NAMES_ABANDONED['calling_status']].isin(statuses_to_process)].copy()
         abandoned_filtered_indices = abandoned_to_process_df.index.tolist()
 
@@ -431,12 +442,13 @@ def distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignmen
     return abandoned_report_counts
 
 
-# --- Main Processing Function --- FULLY UPDATED
+# --- Main Processing Function ---
 def distribute_and_report():
     logger.info("Starting script.")
     settings = load_settings(SETTINGS_FILE)
-    if not settings or 'stakeholders' not in settings:
-        logger.error("Failed to load settings. Aborting.")
+    if not settings or 'stakeholders' not in settings or 'processing_controls' not in settings:
+        logger.error("Failed to load settings or critical settings missing (stakeholders, processing_controls). Aborting.")
+        st.error("Critical settings missing. Aborting.")
         return
 
     ORDERS_SPREADSHEET_ID = settings['sheets']['orders_spreadsheet_id']
@@ -445,226 +457,286 @@ def distribute_and_report():
     stakeholder_list = settings['stakeholders']
     if not stakeholder_list:
         logger.error("Stakeholder list is empty. Aborting.")
+        st.error("Stakeholder list is empty. Aborting.")
         return
     
+    process_orders = settings['processing_controls']['process_orders_sheet']
+    process_abandoned = settings['processing_controls']['process_abandoned_sheet']
+
     stakeholder_assignments = {stakeholder['name']: 0 for stakeholder in stakeholder_list}
     stakeholder_names = [stakeholder['name'] for stakeholder in stakeholder_list]
+    
     service = authenticate_google_sheets()
     if not service:
         logger.error("Authentication failed. Aborting script.")
+        # st.error is handled in authenticate_google_sheets
         return
     sheet = service.spreadsheets()
 
-    _report_categories = list(set(list(STATUS_TO_REPORT_CATEGORY.values()) + ["Abandoned"]))
-    combined_report_counts = {name: {"Total": 0, **{cat: 0 for cat in _report_categories}} for name in stakeholder_names}
+    _report_categories = list(set(list(STATUS_TO_REPORT_CATEGORY.values()) + ["Abandoned"])) # Ensure "Abandoned" is always a category
+    # Initialize report counts
     orders_report_counts = {name: {"Total": 0, **{cat: 0 for cat in _report_categories}} for name in stakeholder_names}
+    abandoned_report_counts_from_func = {name: {"Total": 0, "Abandoned": 0} for name in stakeholder_names} # Simplified for abandoned sheet
 
-    # --- Process Main Orders Sheet ---
-    logger.info("--- Starting Main Orders Processing ---")
-    today_date_str_for_sheet = datetime.date.today().strftime("%d-%b-%Y")
-    initial_assignment_col_name_orders = COL_NAMES_ORDERS['initial_assignment_category']
+    if process_orders:
+        logger.info("--- Starting Main Orders Processing (enabled by settings) ---")
+        today_date_str_for_sheet = datetime.date.today().strftime("%d-%b-%Y")
+        initial_assignment_col_name_orders = COL_NAMES_ORDERS['initial_assignment_category']
 
-    try:
-        logger.info(f"Reading data from '{ORDERS_SHEET_NAME}'...")
-        read_range = f'{ORDERS_SHEET_NAME}!A:BI' # Read wide enough
-        result = sheet.values().get(spreadsheetId=ORDERS_SPREADSHEET_ID, range=read_range).execute()
-        values = result.get('values', [])
+        try:
+            logger.info(f"Reading data from '{ORDERS_SHEET_NAME}'...")
+            read_range = f'{ORDERS_SHEET_NAME}!A:BI' # Read wide enough
+            result = sheet.values().get(spreadsheetId=ORDERS_SPREADSHEET_ID, range=read_range).execute()
+            values = result.get('values', [])
 
-        if not values or ORDERS_HEADER_ROW_INDEX >= len(values):
-            logger.warning(f"No data or insufficient rows in '{ORDERS_SHEET_NAME}'. Skipping Orders processing.")
-        else:
-            orders_header_from_sheet = [str(h).strip() if h is not None else '' for h in values[ORDERS_HEADER_ROW_INDEX]]
-            logger.info(f"Orders sheet header from sheet (row {ORDERS_HEADER_ROW_INDEX + 1}): {orders_header_from_sheet}")
-
-            df_header_orders = orders_header_from_sheet[:]
-            if initial_assignment_col_name_orders not in df_header_orders:
-                logger.warning(f"DataFrame Creation: Column '{initial_assignment_col_name_orders}' not found in Orders sheet header. Adding to DataFrame for processing, but it will NOT be written to sheet if missing there.")
-                df_header_orders.append(initial_assignment_col_name_orders)
-            
-            header_length = len(df_header_orders)
-            data_rows_raw = values[ORDERS_DATA_START_ROW_INDEX:]
-            padded_data_rows = []
-            for i, row in enumerate(data_rows_raw):
-                processed_row = [str(cell).strip() if cell is not None else '' for cell in row]
-                if len(processed_row) < header_length:
-                    processed_row.extend([''] * (header_length - len(processed_row)))
-                elif len(processed_row) > header_length:
-                    processed_row = processed_row[:header_length]
-                padded_data_rows.append(processed_row)
-
-            df = pd.DataFrame(padded_data_rows, columns=df_header_orders)
-            df['_original_row_index'] = range(ORDERS_DATA_START_ROW_INDEX + 1, ORDERS_DATA_START_ROW_INDEX + 1 + len(df))
-
-            cols_to_ensure_in_df_orders = [
-                COL_NAMES_ORDERS['call_status'], COL_NAMES_ORDERS['stakeholder'],
-                COL_NAMES_ORDERS['date_col_1'], COL_NAMES_ORDERS.get('date_col_2'),
-                COL_NAMES_ORDERS.get('date_col_3'), initial_assignment_col_name_orders
-            ]
-            for col_name in cols_to_ensure_in_df_orders:
-                if col_name and col_name not in df.columns:
-                    df[col_name] = ''
-                if col_name:
-                    df[col_name] = df[col_name].astype(str)
-            
-            df[COL_NAMES_ORDERS['call_status']] = df[COL_NAMES_ORDERS['call_status']].fillna('').astype(str).str.strip()
-            all_priority_statuses = [status for priority_list in CALL_PRIORITIES.values() for status in priority_list]
-            orders_to_process_df = df[df[COL_NAMES_ORDERS['call_status']].isin(all_priority_statuses)].copy()
-            orders_filtered_indices = orders_to_process_df.index.tolist()
-
-            if orders_filtered_indices:
-                current_index = 0
-                assigned_orders_processed_count = 0
-                for df_index in orders_filtered_indices:
-                    assigned_stakeholder, current_index = assign_stakeholder_with_limits(current_index, stakeholder_list, stakeholder_assignments)
-                    if assigned_stakeholder is None: continue
-                    
-                    df.loc[df_index, COL_NAMES_ORDERS['stakeholder']] = assigned_stakeholder
-                    call_status = str(df.loc[df_index, COL_NAMES_ORDERS['call_status']]).strip()
-
-                    report_category = STATUS_TO_REPORT_CATEGORY.get(call_status)
-                    if initial_assignment_col_name_orders in df.columns:
-                        if report_category:
-                            df.loc[df_index, initial_assignment_col_name_orders] = report_category
-                        else:
-                            df.loc[df_index, initial_assignment_col_name_orders] = "Unknown"
-                            logger.warning(f"Orders Row {df.loc[df_index, '_original_row_index']}: Could not map call_status '{call_status}' to Initial Assignment. Set to 'Unknown'.")
-                    
-                    assigned_orders_processed_count += 1
-                    orders_report_counts[assigned_stakeholder]["Total"] += 1
-                    if report_category and report_category in orders_report_counts[assigned_stakeholder]:
-                        orders_report_counts[assigned_stakeholder][report_category] += 1
-                    
-                    date1_val = str(df.loc[df_index, COL_NAMES_ORDERS['date_col_1']]).strip()
-                    date2_exists = COL_NAMES_ORDERS['date_col_2'] in df.columns
-                    date3_exists = COL_NAMES_ORDERS['date_col_3'] in df.columns
-                    date2_val = str(df.loc[df_index, COL_NAMES_ORDERS['date_col_2']]).strip() if date2_exists else ""
-                    date3_val = str(df.loc[df_index, COL_NAMES_ORDERS['date_col_3']]).strip() if date3_exists else ""
-
-                    if call_status == "Call didn't Pick":
-                        if not date1_val:
-                            df.loc[df_index, COL_NAMES_ORDERS['date_col_1']] = today_date_str_for_sheet
-                        elif not date2_val and date2_exists:
-                            df.loc[df_index, COL_NAMES_ORDERS['date_col_2']] = today_date_str_for_sheet
-                        elif not date3_val and date3_exists:
-                            df.loc[df_index, COL_NAMES_ORDERS['date_col_3']] = today_date_str_for_sheet
-                    else:
-                        df.loc[df_index, COL_NAMES_ORDERS['date_col_1']] = today_date_str_for_sheet
-                        if date2_exists: df.loc[df_index, COL_NAMES_ORDERS['date_col_2']] = ''
-                        if date3_exists: df.loc[df_index, COL_NAMES_ORDERS['date_col_3']] = ''
-                logger.info(f"Stakeholder, category, and date logic applied to {assigned_orders_processed_count} Orders rows.")
-
-            # --- BATCH UPDATE SECTION REVISED ---
-            logger.info("Preparing batch update for Orders sheet...")
-            orders_updates = []
-            cols_we_are_changing_orders = [
-                COL_NAMES_ORDERS['stakeholder'], COL_NAMES_ORDERS['date_col_1'],
-                COL_NAMES_ORDERS['date_col_2'], COL_NAMES_ORDERS['date_col_3'],
-                initial_assignment_col_name_orders
-            ]
-            max_sheet_col_index_orders = len(orders_header_from_sheet) - 1
-            update_range_end_col_a1_orders = col_index_to_a1(max_sheet_col_index_orders)
-
-            for df_index in orders_filtered_indices:
-                if not pd.isna(df.loc[df_index, COL_NAMES_ORDERS['stakeholder']]) and \
-                   df.loc[df_index, COL_NAMES_ORDERS['stakeholder']] != '':
-                    original_sheet_row_num = df.loc[df_index, '_original_row_index']
-                    row_values_to_write = [''] * len(orders_header_from_sheet)
-                    
-                    modified_in_df_and_writable_to_sheet = False
-                    for sheet_col_idx, sheet_col_name in enumerate(orders_header_from_sheet):
-                        if sheet_col_name in df.columns:
-                            df_value = df.loc[df_index, sheet_col_name]
-                            row_values_to_write[sheet_col_idx] = df_value if pd.notna(df_value) else ''
-                            if sheet_col_name in cols_we_are_changing_orders:
-                                modified_in_df_and_writable_to_sheet = True
-                    
-                    if modified_in_df_and_writable_to_sheet:
-                        orders_updates.append({
-                            'range': f'{ORDERS_SHEET_NAME}!A{original_sheet_row_num}:{update_range_end_col_a1_orders}{original_sheet_row_num}',
-                            'values': [row_values_to_write]
-                        })
-            
-            logger.info(f"Prepared {len(orders_updates)} row updates for Orders sheet batch write.")
-            if orders_updates:
-                logger.info("Executing batch update to Orders sheet...")
-                body = {'value_input_option': 'USER_ENTERED', 'data': orders_updates} # USER_ENTERED to preserve formats
-                try:
-                    result = sheet.values().batchUpdate(spreadsheetId=ORDERS_SPREADSHEET_ID, body=body).execute()
-                    logger.info(f"Orders sheet batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
-                except HttpError as e: logger.error(f"API Error during Orders sheet batch update: {e}")
-                except Exception as e: logger.exception("Unexpected error during Orders sheet batch update:")
+            if not values or ORDERS_HEADER_ROW_INDEX >= len(values):
+                logger.warning(f"No data or insufficient rows in '{ORDERS_SHEET_NAME}'. Skipping Orders processing details.")
             else:
-                logger.info("No updates to write back to Orders sheet.")
-    except HttpError as err: logger.error(f"Google Sheets API Error during main Orders execution: {err}")
-    except Exception as e: logger.exception("Unexpected error during main Orders execution:")
-    logger.info("--- Finished Main Orders Processing ---")
+                orders_header_from_sheet = [str(h).strip() if h is not None else '' for h in values[ORDERS_HEADER_ROW_INDEX]]
+                logger.info(f"Orders sheet header from sheet (row {ORDERS_HEADER_ROW_INDEX + 1}): {orders_header_from_sheet}")
 
-    abandoned_report_counts_from_func = distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments, ABANDONED_SPREADSHEET_ID, ABANDONED_SHEET_NAME)
+                df_header_orders = orders_header_from_sheet[:]
+                if initial_assignment_col_name_orders not in df_header_orders:
+                    logger.warning(f"DataFrame Creation: Column '{initial_assignment_col_name_orders}' not found in Orders sheet header. Adding to DataFrame for processing, but it will NOT be written to sheet if missing there.")
+                    df_header_orders.append(initial_assignment_col_name_orders)
+                
+                header_length = len(df_header_orders)
+                data_rows_raw = values[ORDERS_DATA_START_ROW_INDEX:]
+                padded_data_rows = []
+                for i, row in enumerate(data_rows_raw):
+                    processed_row = [str(cell).strip() if cell is not None else '' for cell in row]
+                    if len(processed_row) < header_length:
+                        processed_row.extend([''] * (header_length - len(processed_row)))
+                    elif len(processed_row) > header_length:
+                        processed_row = processed_row[:header_length]
+                    padded_data_rows.append(processed_row)
 
-    logger.info("Combining report counts from Orders and Abandoned sheets...")
+                df = pd.DataFrame(padded_data_rows, columns=df_header_orders)
+                df['_original_row_index'] = range(ORDERS_DATA_START_ROW_INDEX + 1, ORDERS_DATA_START_ROW_INDEX + 1 + len(df))
+
+                cols_to_ensure_in_df_orders = [
+                    COL_NAMES_ORDERS['call_status'], COL_NAMES_ORDERS['stakeholder'],
+                    COL_NAMES_ORDERS['date_col_1'], COL_NAMES_ORDERS.get('date_col_2'),
+                    COL_NAMES_ORDERS.get('date_col_3'), initial_assignment_col_name_orders
+                ]
+                for col_name in cols_to_ensure_in_df_orders:
+                    if col_name and col_name not in df.columns:
+                        df[col_name] = ''
+                    if col_name: # Ensure string type
+                        df[col_name] = df[col_name].astype(str).fillna('')
+                
+                df[COL_NAMES_ORDERS['call_status']] = df[COL_NAMES_ORDERS['call_status']].fillna('').astype(str).str.strip()
+                all_priority_statuses = [status for priority_list in CALL_PRIORITIES.values() for status in priority_list]
+                orders_to_process_df = df[df[COL_NAMES_ORDERS['call_status']].isin(all_priority_statuses)].copy()
+                orders_filtered_indices = orders_to_process_df.index.tolist()
+
+                if orders_filtered_indices:
+                    current_index = 0 # For round-robin
+                    assigned_orders_processed_count = 0
+                    for df_index in orders_filtered_indices:
+                        assigned_stakeholder, current_index = assign_stakeholder_with_limits(current_index, stakeholder_list, stakeholder_assignments)
+                        if assigned_stakeholder is None:
+                            logger.warning(f"Orders Row (original index {df.loc[df_index, '_original_row_index']}): No stakeholder has remaining capacity. Skipping assignment.")
+                            continue
+                        
+                        df.loc[df_index, COL_NAMES_ORDERS['stakeholder']] = assigned_stakeholder
+                        call_status = str(df.loc[df_index, COL_NAMES_ORDERS['call_status']]).strip()
+
+                        report_category = STATUS_TO_REPORT_CATEGORY.get(call_status)
+                        if initial_assignment_col_name_orders in df.columns: # Only set if column exists in DF
+                            if report_category:
+                                df.loc[df_index, initial_assignment_col_name_orders] = report_category
+                            else:
+                                df.loc[df_index, initial_assignment_col_name_orders] = "Unknown" # Fallback
+                                logger.warning(f"Orders Row {df.loc[df_index, '_original_row_index']}: Could not map call_status '{call_status}' to Initial Assignment. Set to 'Unknown'.")
+                        
+                        assigned_orders_processed_count += 1
+                        orders_report_counts[assigned_stakeholder]["Total"] += 1
+                        if report_category and report_category in orders_report_counts[assigned_stakeholder]:
+                            orders_report_counts[assigned_stakeholder][report_category] += 1
+                        
+                        # Date logic
+                        date1_val = str(df.loc[df_index, COL_NAMES_ORDERS['date_col_1']]).strip()
+                        date2_exists = COL_NAMES_ORDERS.get('date_col_2') in df.columns
+                        date3_exists = COL_NAMES_ORDERS.get('date_col_3') in df.columns
+                        date2_val = str(df.loc[df_index, COL_NAMES_ORDERS.get('date_col_2')]).strip() if date2_exists else ""
+                        date3_val = str(df.loc[df_index, COL_NAMES_ORDERS.get('date_col_3')]).strip() if date3_exists else ""
+
+
+                        if call_status == "Call didn't Pick":
+                            if not date1_val:
+                                df.loc[df_index, COL_NAMES_ORDERS['date_col_1']] = today_date_str_for_sheet
+                            elif not date2_val and date2_exists:
+                                df.loc[df_index, COL_NAMES_ORDERS['date_col_2']] = today_date_str_for_sheet
+                            elif not date3_val and date3_exists:
+                                df.loc[df_index, COL_NAMES_ORDERS['date_col_3']] = today_date_str_for_sheet
+                            # else: all dates filled, stakeholder assigned, no specific date change here by this rule
+                        else: # For all other statuses eligible for assignment (Fresh, NDR, etc.)
+                            df.loc[df_index, COL_NAMES_ORDERS['date_col_1']] = today_date_str_for_sheet
+                            if date2_exists: df.loc[df_index, COL_NAMES_ORDERS['date_col_2']] = ''
+                            if date3_exists: df.loc[df_index, COL_NAMES_ORDERS['date_col_3']] = ''
+                    logger.info(f"Stakeholder, category, and date logic applied to {assigned_orders_processed_count} Orders rows.")
+                else:
+                    logger.info("No Orders rows matched filter criteria for assignment/reassignment.")
+
+
+                # --- BATCH UPDATE SECTION FOR ORDERS ---
+                logger.info("Preparing batch update for Orders sheet...")
+                orders_updates = []
+                cols_we_are_changing_orders = [
+                    col for col in [
+                        COL_NAMES_ORDERS['stakeholder'], COL_NAMES_ORDERS['date_col_1'],
+                        COL_NAMES_ORDERS.get('date_col_2'), COL_NAMES_ORDERS.get('date_col_3'),
+                        initial_assignment_col_name_orders
+                    ] if col and col in orders_header_from_sheet # ensure col exists in sheet header
+                ]
+                if not cols_we_are_changing_orders:
+                    logger.warning("None of the target columns for Orders sheet update are present in its header. No updates will be written for Orders.")
+                else:
+                    max_sheet_col_index_orders = len(orders_header_from_sheet) - 1
+                    update_range_end_col_a1_orders = col_index_to_a1(max_sheet_col_index_orders)
+
+                    assigned_indices_in_df_orders = [
+                        idx for idx in orders_filtered_indices 
+                        if not pd.isna(df.loc[idx, COL_NAMES_ORDERS['stakeholder']]) and \
+                        df.loc[idx, COL_NAMES_ORDERS['stakeholder']] != ''
+                    ]
+
+                    for df_index in assigned_indices_in_df_orders:
+                        original_sheet_row_num = df.loc[df_index, '_original_row_index']
+                        row_values_to_write = [''] * len(orders_header_from_sheet)
+                        
+                        modified_a_target_column_orders = False
+                        for sheet_col_idx, sheet_col_name in enumerate(orders_header_from_sheet):
+                            if sheet_col_name in df.columns:
+                                df_value = df.loc[df_index, sheet_col_name]
+                                row_values_to_write[sheet_col_idx] = str(df_value) if pd.notna(df_value) else ''
+                                if sheet_col_name in cols_we_are_changing_orders:
+                                    modified_a_target_column_orders = True
+                        
+                        if modified_a_target_column_orders:
+                            orders_updates.append({
+                                'range': f'{ORDERS_SHEET_NAME}!A{original_sheet_row_num}:{update_range_end_col_a1_orders}{original_sheet_row_num}',
+                                'values': [row_values_to_write]
+                            })
+                
+                logger.info(f"Prepared {len(orders_updates)} row updates for Orders sheet batch write.")
+                if orders_updates:
+                    logger.info("Executing batch update to Orders sheet...")
+                    body = {'value_input_option': 'USER_ENTERED', 'data': orders_updates}
+                    try:
+                        result = sheet.values().batchUpdate(spreadsheetId=ORDERS_SPREADSHEET_ID, body=body).execute()
+                        logger.info(f"Orders sheet batch update completed. {result.get('totalUpdatedCells', 'N/A')} cells updated.")
+                    except HttpError as e: logger.error(f"API Error during Orders sheet batch update: {e}")
+                    except Exception as e: logger.exception("Unexpected error during Orders sheet batch update:")
+                else:
+                    logger.info("No updates to write back to Orders sheet.")
+        except HttpError as err: logger.error(f"Google Sheets API Error during main Orders execution: {err}")
+        except Exception as e: logger.exception("Unexpected error during main Orders execution:")
+        logger.info("--- Finished Main Orders Processing ---")
+    else:
+        logger.info("--- Main Orders Processing SKIPPED (disabled by settings) ---")
+
+    if process_abandoned:
+        # Pass the current state of stakeholder_assignments so limits are shared
+        abandoned_report_counts_from_func = distribute_abandoned_orders(service, stakeholder_list, stakeholder_assignments, ABANDONED_SPREADSHEET_ID, ABANDONED_SHEET_NAME)
+    else:
+        logger.info("--- Abandoned Orders Processing SKIPPED (disabled by settings) ---")
+        # Ensure abandoned_report_counts_from_func is initialized if skipped
+        abandoned_report_counts_from_func = {name: {"Total": 0, "Abandoned": 0} for name in stakeholder_names}
+
+
+    logger.info("Combining report counts from processed sheets...")
+    combined_report_counts = {name: {"Total": 0, **{cat: 0 for cat in _report_categories}} for name in stakeholder_names}
+
     for name in stakeholder_names:
         total_orders = orders_report_counts.get(name, {}).get("Total", 0)
         total_abandoned = abandoned_report_counts_from_func.get(name, {}).get("Total", 0)
         combined_report_counts[name]["Total"] = total_orders + total_abandoned
+
         for category in _report_categories:
             orders_cat_count = orders_report_counts.get(name, {}).get(category, 0)
             abandoned_cat_val = 0
-            if category == "Abandoned":
+            if category == "Abandoned": # "Abandoned" category specifically comes from the abandoned sheet's "Abandoned" count
                 abandoned_cat_val = abandoned_report_counts_from_func.get(name, {}).get("Abandoned", 0)
+            # Other categories (Fresh, CNP etc.) only come from orders_report_counts for this structure
             combined_report_counts[name][category] = orders_cat_count + abandoned_cat_val
     logger.info("Report counts combined.")
+
 
     logger.info("Generating Combined Stakeholder Report...")
     formatted_report_values = []
     today_date_str_for_report = datetime.date.today().strftime("%d-%b-%Y")
     formatted_report_values.append([f"--- Stakeholder Report for Assignments on {today_date_str_for_report} ---"])
-    formatted_report_values.append([''])
-    report_category_order_display = ["Fresh", "Abandoned", "Invalid/Fake", "CNP", "Follow up", "NDR"]
+    formatted_report_values.append(['']) # Blank line
+    report_category_order_display = ["Fresh", "Abandoned", "Invalid/Fake", "CNP", "Follow up", "NDR"] # Desired display order
+
     for s_name_iter in stakeholder_names:
         formatted_report_values.append([f"Calls assigned {s_name_iter}"])
         formatted_report_values.append([f"- Total Calls This Run - {combined_report_counts[s_name_iter].get('Total', 0)}"])
         for category_to_display in report_category_order_display:
             count_val = combined_report_counts[s_name_iter].get(category_to_display, 0)
             formatted_report_values.append([f"- {category_to_display} - {count_val}"])
-        formatted_report_values.append([''])
+        formatted_report_values.append(['']) # Blank line after each stakeholder
     formatted_report_values.append(['--- End of Report for ' + today_date_str_for_report + ' ---'])
     
-    logger.info(f"Writing report to '{REPORT_SHEET_NAME}'...")
+    logger.info(f"Writing report to '{REPORT_SHEET_NAME}' in spreadsheet ID: {ORDERS_SPREADSHEET_ID}...") # Report is in Orders Spreadsheet
     start_row_existing, end_row_existing = find_existing_report_range(sheet, ORDERS_SPREADSHEET_ID, REPORT_SHEET_NAME, today_date_str_for_report)
+    
     if start_row_existing is not None and end_row_existing is not None:
-        range_to_clear = f'{REPORT_SHEET_NAME}!A{start_row_existing}:Z{end_row_existing}'
+        range_to_clear = f'{REPORT_SHEET_NAME}!A{start_row_existing}:Z{end_row_existing}' # Clear wide enough
         range_to_write_new = f'{REPORT_SHEET_NAME}!A{start_row_existing}'
+        logger.info(f"Clearing existing report range: {range_to_clear}")
         try:
             sheet.values().clear(spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_clear).execute()
             body = {'values': formatted_report_values}
+            logger.info(f"Updating report at: {range_to_write_new}")
             sheet.values().update(spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_write_new, valueInputOption='USER_ENTERED', body=body).execute()
             logger.info("Report updated.")
-        except Exception as e: logger.exception(f"Error updating report: {e}")
+            if 'st' in sys.modules: st.success("Report updated in Google Sheets.")
+        except Exception as e:
+            logger.exception(f"Error updating report: {e}")
+            if 'st' in sys.modules: st.error(f"Error updating report: {e}")
     else:
         start_row_for_append = 1
         try:
+            # Check if sheet exists and get last row if it does
             result_existing_report = sheet.values().get(spreadsheetId=ORDERS_SPREADSHEET_ID, range=f'{REPORT_SHEET_NAME}!A:A').execute()
             existing_values = result_existing_report.get('values', [])
-            if existing_values: start_row_for_append = len(existing_values) + 2
+            if existing_values:
+                start_row_for_append = len(existing_values) + 2 # Add some spacing
         except HttpError as e:
-            if 'Unable to parse range' in str(e) or (hasattr(e, 'resp') and e.resp.status == 400):
+            if 'Unable to parse range' in str(e) or (hasattr(e, 'resp') and e.resp and e.resp.status == 400):
+                # Sheet does not exist, try to create it
                 try:
                     logger.warning(f"Sheet '{REPORT_SHEET_NAME}' not found. Creating it for the report.")
                     add_sheet_body = {'requests': [{'addSheet': {'properties': {'title': REPORT_SHEET_NAME}}}]}
                     sheet.batchUpdate(spreadsheetId=ORDERS_SPREADSHEET_ID, body=add_sheet_body).execute()
-                    start_row_for_append = 1
+                    logger.info(f"Sheet '{REPORT_SHEET_NAME}' created.")
+                    start_row_for_append = 1 # Start at row 1 in new sheet
                 except Exception as create_err:
                     logger.error(f"Error creating sheet '{REPORT_SHEET_NAME}': {create_err}")
-                    return
-            else: raise e
+                    if 'st' in sys.modules: st.error(f"Error creating report sheet: {create_err}")
+                    return # Cannot proceed if sheet creation fails
+            else:
+                logger.error(f"Google Sheets API Error when checking for report sheet: {e}")
+                if 'st' in sys.modules: st.error(f"API error checking report sheet: {e}")
+                raise e # Re-raise if it's not a "sheet not found" error
+
         if formatted_report_values:
             body = {'values': formatted_report_values}
             range_to_write_report = f'{REPORT_SHEET_NAME}!A{start_row_for_append}'
+            logger.info(f"Writing new report to: {range_to_write_report}")
             try:
                 sheet.values().update(spreadsheetId=ORDERS_SPREADSHEET_ID, range=range_to_write_report, valueInputOption='USER_ENTERED', body=body).execute()
                 logger.info(f"Report written to {range_to_write_report}.")
-            except Exception as e: logger.exception(f"Error writing new report: {e}")
-        else: logger.warning("No report data to write.")
+                if 'st' in sys.modules: st.success("New report written to Google Sheets.")
+            except Exception as e:
+                logger.exception(f"Error writing new report: {e}")
+                if 'st' in sys.modules: st.error(f"Error writing new report: {e}")
+        else:
+            logger.warning("No report data to write.")
+            if 'st' in sys.modules: st.warning("No report data generated.")
     logger.info("Script finished execution.")
 
 # --- Main Execution ---

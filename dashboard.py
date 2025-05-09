@@ -2,10 +2,10 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go # For more complex charts like funnels
 import yaml
-import sys
 from pathlib import Path
-import re # For parsing potentially non-numeric counts
+import re
 
 # --- Google Sheets Authentication & Data Loading ---
 from google.oauth2 import service_account
@@ -84,255 +84,348 @@ def authenticate_google_sheets_st():
         st.error(f"Error building Sheets service: {e}")
         return None
 
-# --- Data Loading and Parsing for Summary Sheet ---
-@st.cache_data(ttl=600)
-def load_summary_data(_service, spreadsheet_id, sheet_name):
-    """Reads the Summary sheet and parses key metrics."""
-    if not _service: return None
+# --- NEW: More Structured Data Parsing for Summary Sheet ---
+@st.cache_data(ttl=300) # Cache for 5 minutes
+def load_and_parse_summary_sheet(_service, spreadsheet_id, sheet_name):
+    if not _service: return None, "Authentication service not available."
     st.info(f"Loading data from summary sheet: '{sheet_name}'")
     try:
-        # Read a wider range to be safe
-        range_to_read = f"'{sheet_name}'!A1:I30" # Adjust if your summary expands
+        # Read a fairly large, fixed range that covers all expected data blocks.
+        # This is simpler than trying to dynamically find blocks if the layout is stable.
+        range_to_read = f"'{sheet_name}'!A1:H30" # Adjust H30 if your sheet grows beyond
         result = _service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_to_read
         ).execute()
-        values = result.get('values', [])
+        raw_values = result.get('values', [])
     except HttpError as e:
-        st.error(f"API Error reading sheet '{sheet_name}': {e}")
-        return None
+        return None, f"API Error reading sheet '{sheet_name}': {e}"
     except Exception as e:
-        st.error(f"Unexpected error reading sheet '{sheet_name}': {e}")
-        return None
+        return None, f"Unexpected error reading sheet '{sheet_name}': {e}"
 
-    if not values:
-        st.warning(f"No data found in summary sheet: '{sheet_name}'")
-        return None
+    if not raw_values:
+        return None, f"No data found in summary sheet: '{sheet_name}'"
 
-    # --- Parsing Logic ---
-    # Use a dictionary to store parsed values {Metric_Name: Count}
-    summary_metrics = {}
+    # Create a DataFrame for easier slicing and searching (optional, but can be helpful)
+    # Pad rows to have consistent length for DataFrame creation
+    max_cols = max(len(row) for row in raw_values) if raw_values else 0
+    padded_values = [row + [''] * (max_cols - len(row)) for row in raw_values]
+    df_summary = pd.DataFrame(padded_values)
 
-    def safe_int_parse(value_str):
-        """Safely attempts to convert a string to an int, handling commas etc."""
-        if not isinstance(value_str, str):
-             value_str = str(value_str) # Convert potential numbers/other types to string first
-        # Remove commas, whitespace, potentially percentage signs if needed
-        cleaned_str = re.sub(r'[,\s%]', '', value_str).strip()
+    parsed_data = {
+        "kpis": {},
+        "call_statuses": {},
+        "fulfillment_statuses": {},
+        "high_level_summary": {},
+        "payment_summary": {}
+    }
+    
+    def safe_int(val_str):
+        if val_str is None or val_str == '': return 0
+        # Remove non-numeric characters except decimal point if present
+        cleaned = re.sub(r'[^\d\.]', '', str(val_str))
         try:
-            # Handle potential non-numeric values gracefully
-            if cleaned_str.isdigit():
-                 return int(cleaned_str)
-            else:
-                 # Attempt float conversion if it looks like a number with decimals, then int
-                 try:
-                      return int(float(cleaned_str))
-                 except ValueError:
-                      # If cleaning and conversion fail, return 0 or None
-                      return 0 # Default to 0 if parsing fails
-        except ValueError:
-            return 0 # Default to 0 if any conversion error occurs
+            return int(float(cleaned)) # Convert to float first to handle "1,202.00" then int
+        except (ValueError, TypeError):
+            return 0
 
-    # Iterate through rows to find specific metrics
-    for row in values:
-        if not row or len(row) < 2: continue # Need at least Metric and Count columns
+    # --- Parse Block 1: Initial Call/Order Statuses (A2:C12 approx) ---
+    # Assuming labels in col 0 (A), counts in col 1 (B)
+    # Define expected labels to look for to make it robust
+    expected_call_labels = [
+        "Total Orders", "Confirmed", "COD to Prepaid", "Cancelled",
+        "Call didn't Pick", "Whatsapp msg-sent", "Follow Up",
+        "Number invalid/fake order", "Prepaid", "NDR", "Confirmation Pending"
+    ]
+    for r_idx in range(1, 15): # Iterate roughly where these labels are (rows 2 to 16)
+        if r_idx < len(df_summary):
+            label = str(df_summary.iloc[r_idx, 0]).strip()
+            if label in expected_call_labels:
+                parsed_data["call_statuses"][label] = safe_int(df_summary.iloc[r_idx, 1])
+                if label == "Total Orders": # Also a KPI
+                    parsed_data["kpis"]["Total Orders (Block1)"] = safe_int(df_summary.iloc[r_idx, 1])
 
-        metric_label = str(row[0]).strip()
-        count_val_raw = row[1] # Value from Col B
 
-        # Parse metrics from columns A & B
-        if metric_label: # Only process if label exists
-             count = safe_int_parse(count_val_raw)
-             summary_metrics[metric_label] = count
+    # --- Parse Block 2: High-Level Summary (F2:H7 approx) ---
+    # Labels in col 5 (F), counts in col 6 (G)
+    expected_high_level_labels = {
+        "Total Orders": "Total Orders (Summary)", # Sheet Label : Key in parsed_data
+        "Total Dispatched": "Total Dispatched",
+        "Total Pending To Dispatch": "Total Pending To Dispatch",
+        "Total Cancelled": "Total Cancelled (Summary)",
+        "Total RTO": "Total RTO (Summary)",
+        "Call In Progress": "Call In Progress"
+    }
+    for r_idx in range(1, 10): # Iterate roughly where these are
+         if r_idx < len(df_summary) and len(df_summary.columns) > 6:
+            label = str(df_summary.iloc[r_idx, 5]).strip()
+            if label in expected_high_level_labels:
+                data_key = expected_high_level_labels[label]
+                parsed_data["high_level_summary"][data_key] = safe_int(df_summary.iloc[r_idx, 6])
+                if data_key == "Total Orders (Summary)": # Also a KPI
+                     parsed_data["kpis"]["Total Orders (Summary)"] = safe_int(df_summary.iloc[r_idx, 6])
 
-        # Parse metrics from columns F & G (High-Level Summary)
-        if len(row) > 6: # Check if columns F & G exist
-             metric_label_f = str(row[5]).strip() # Col F (index 5)
-             count_val_g_raw = row[6] # Col G (index 6)
-             if metric_label_f:
-                 count_g = safe_int_parse(count_val_g_raw)
-                 # Avoid overwriting if label exists from Col A, maybe prefix?
-                 summary_metrics[f"{metric_label_f} (Summary)"] = count_g # Add suffix
 
-        # Parse metrics from columns F & G (Shipment/Payment Statuses - lower section)
-        # These labels might conflict, need careful handling or specific row checks
-        # Example: Check if row index is within the expected range for these summaries
-        row_index = values.index(row) # Get current row index (0-based)
+    # --- Parse Block 3: Fulfillment/Detailed Statuses (A14:C21 approx) ---
+    # Labels in col 0 (A), counts in col 1 (B)
+    expected_fulfillment_labels = [
+        "Delivered", "Out for delivery", "In-transit", "Pending Pick up",
+        "Cancel", "RTO", "Pending To Be Dispatch"
+        # "Confirmation Pending" appears here again, decide how to handle (overwrite or sum?)
+    ]
+    # Handle potential duplicate "Confirmation Pending" - maybe use the one from call_statuses
+    # or sum if they represent different things. For now, we'll take the first one from Block 1.
+    for r_idx in range(13, 25): # Iterate roughly where these are
+        if r_idx < len(df_summary):
+            label = str(df_summary.iloc[r_idx, 0]).strip()
+            if label in expected_fulfillment_labels:
+                 # Avoid overwriting if label also exists in call_statuses (e.g. "Cancel")
+                 # unless it's explicitly a fulfillment version.
+                 if label == "Cancel" and "Cancelled" in parsed_data["call_statuses"]:
+                     # Assuming this "Cancel" in fulfillment block is more specific or a duplicate
+                     # For now, let's prioritize the one from high-level summary if available
+                     if "Total Cancelled (Summary)" not in parsed_data["high_level_summary"]:
+                        parsed_data["fulfillment_statuses"][label] = safe_int(df_summary.iloc[r_idx, 1])
+                 else:
+                    parsed_data["fulfillment_statuses"][label] = safe_int(df_summary.iloc[r_idx, 1])
 
-        # --- Specific Parsing for Shipment/Payment (needs adjustment based on exact row numbers) ---
-        # This requires knowing the exact rows or more robust label finding
-        # For demonstration, let's assume these specific labels are unique enough for now
-        
-        if metric_label == "Cod": # Check label in Col A for Cod/Prepaid Totals
-             if len(row) > 7: # Check if Col H exists
-                  cod_count = safe_int_parse(row[7]) # Count seems to be in Col H for Cod/Prepaid
-                  summary_metrics["Cod Orders"] = cod_count
-                  
-        if metric_label == "Prepaid": # Check label in Col A
-             if len(row) > 7:
-                  prepaid_count = safe_int_parse(row[7])
-                  summary_metrics["Prepaid Orders"] = prepaid_count
 
-        # Add more specific parsing logic here if needed based on layout
+    # --- Parse Block 5: Payment Summary (F21:H23 approx) ---
+    # Assuming "Cod" label in F22, "Prepaid" in F23, counts in G22, G23
+    # Based on image: Col F has label, Col G has count (for this specific block)
+    # The image shows Cod/Prepaid counts in Col H relative to their labels in Col A though...
+    # Let's reconcile. The image seems to show "Cod" in A22, count in B22.
+    # And "Prepaid" in A10, count in B10.
+    # The block around F21-H23 has Cod/Prepaid labels in F and counts in G. Let's try that.
+    if 21 < len(df_summary) and len(df_summary.columns) > 6:
+        cod_label = str(df_summary.iloc[21, 5]).strip() # Expected "Cod" at F22 (index 21,5)
+        if "Cod" in cod_label: # Flexible match
+            parsed_data["payment_summary"]["COD"] = safe_int(df_summary.iloc[21, 6])
+    if 22 < len(df_summary) and len(df_summary.columns) > 6:
+        prepaid_label = str(df_summary.iloc[22, 5]).strip() # Expected "Prepaid" at F23 (index 22,5)
+        if "Prepaid" in prepaid_label:
+            parsed_data["payment_summary"]["Prepaid"] = safe_int(df_summary.iloc[22, 6])
+    
+    # Fallback if the F column parsing didn't work, use values from call_statuses
+    if "COD" not in parsed_data["payment_summary"] :
+        parsed_data["payment_summary"]["COD"] = parsed_data["call_statuses"].get("Total Orders",0) - parsed_data["call_statuses"].get("Prepaid",0)
 
-    if not summary_metrics:
-         st.warning("Failed to parse any key metrics from the Summary sheet.")
-         return None
+    if "Prepaid" not in parsed_data["payment_summary"] or parsed_data["payment_summary"]["Prepaid"] == 0:
+         parsed_data["payment_summary"]["Prepaid"] = parsed_data["call_statuses"].get("Prepaid",0)
 
-    # st.success(f"Successfully loaded and parsed summary data. Found {len(summary_metrics)} metrics.")
-    return summary_metrics
 
+    # --- Final KPI calculations and cleanup ---
+    # Prefer summary block total orders if available
+    parsed_data["kpis"]["Total Orders"] = parsed_data["kpis"].get("Total Orders (Summary)", parsed_data["kpis"].get("Total Orders (Block1)", 0))
+    
+    # Confirmed orders (main KPI)
+    parsed_data["kpis"]["Confirmed"] = parsed_data["call_statuses"].get("Confirmed", 0)
+
+    # Dispatched from high-level summary
+    parsed_data["kpis"]["Dispatched"] = parsed_data["high_level_summary"].get("Total Dispatched", 0)
+    
+    # Delivered from fulfillment statuses
+    parsed_data["kpis"]["Delivered"] = parsed_data["fulfillment_statuses"].get("Delivered", 0)
+
+    # RTO from fulfillment or high-level
+    parsed_data["kpis"]["RTO"] = parsed_data["high_level_summary"].get("Total RTO (Summary)", parsed_data["fulfillment_statuses"].get("RTO",0) )
+    
+    # Cancelled from high-level or call_statuses
+    parsed_data["kpis"]["Cancelled"] = parsed_data["high_level_summary"].get("Total Cancelled (Summary)", parsed_data["call_statuses"].get("Cancelled",0))
+
+    # Call In Progress
+    parsed_data["kpis"]["Call In Progress"] = parsed_data["high_level_summary"].get("Call In Progress", 0)
+    if parsed_data["kpis"]["Call In Progress"] == 0: # Estimate from "Confirmation Pending" if Call In Progress is 0
+        parsed_data["kpis"]["Call In Progress"] = parsed_data["call_statuses"].get("Confirmation Pending",0)
+
+
+    if not parsed_data["kpis"].get("Total Orders"):
+        return None, "Failed to parse 'Total Orders' metric, essential for dashboard."
+
+    st.success(f"Summary data parsed. Total Orders: {parsed_data['kpis']['Total Orders']}")
+    return parsed_data, None # Data, Error Message
 
 # --- Main Page Content ---
-st.title("🛒 Shopify CRM Dashboard")
-st.sidebar.success("Select a tool above.")
-
-# Display basic info (optional)
-# st.info(f"Project Root: `{PROJECT_ROOT}`")
-# st.info(f"Settings File: `{SETTINGS_FILE}`")
-# if SETTINGS_FILE.is_file(): st.success("`settings.yaml` found.")
-# else: st.error("`settings.yaml` not found.")
-
-st.markdown("### Overall CRM Summary")
-st.caption("Data loaded from the 'Summery' sheet.")
+st.title("🛒 CRM & Order Fulfillment Dashboard")
+st.sidebar.success("Select a tool or view above.")
 
 # --- Authenticate and Load Data ---
 service = authenticate_google_sheets_st()
-summary_data = None
-if service and ORDERS_SPREADSHEET_ID:
-    summary_data = load_summary_data(service, ORDERS_SPREADSHEET_ID, SUMMARY_SHEET_NAME)
+parsed_summary_data, error_msg = None, None
 
-# --- Display Dashboard Elements ---
-if summary_data:
-    # --- Top Row Metrics ---
-    st.markdown("#### Key Totals")
-    m_cols = st.columns(4) # Create 4 columns for metrics
+if service:
+    parsed_summary_data, error_msg = load_and_parse_summary_sheet(service, ORDERS_SPREADSHEET_ID, SUMMARY_SHEET_NAME)
+    if error_msg:
+        st.error(error_msg)
+elif not service:
+     st.error("Google Sheets Authentication failed. Cannot load summary data.")
 
-    total_orders = summary_data.get('Total Orders', 0)
-    confirmed_orders = summary_data.get('Confirmed', 0)
-    # Use the "Total Delivered (Summary)" if available, else the one from Col A/B
-    delivered_orders = summary_data.get('Total Delivered (Summary)', summary_data.get('Delivered', 0))
-    # Use the "Total Cancelled (Summary)" if available
-    cancelled_orders = summary_data.get('Total Cancelled (Summary)', summary_data.get('Cancelled', 0))
 
-    m_cols[0].metric("Total Orders", f"{total_orders:,}")
-    m_cols[1].metric("Confirmed Orders", f"{confirmed_orders:,}",
-                     f"{confirmed_orders/total_orders:.1%}" if total_orders else "0%")
-    m_cols[2].metric("Delivered Orders", f"{delivered_orders:,}",
-                     f"{delivered_orders/total_orders:.1%}" if total_orders else "0%")
-    m_cols[3].metric("Cancelled Orders", f"{cancelled_orders:,}",
-                     f"{cancelled_orders/total_orders:.1%}" if total_orders else "0%")
+# --- NEW Dashboard Layout ---
+if parsed_summary_data:
+    kpis = parsed_summary_data["kpis"]
+    call_statuses = parsed_summary_data["call_statuses"]
+    fulfillment_statuses = parsed_summary_data["fulfillment_statuses"]
+    high_level = parsed_summary_data["high_level_summary"]
+    # payment_summary = parsed_summary_data["payment_summary"] # You mentioned it's all prepaid
 
-    st.markdown("---") # Separator
+    total_orders_main = kpis.get("Total Orders", 0)
 
-    # --- Charts Row 1 ---
-    st.markdown("#### Status Breakdowns")
-    chart_cols1 = st.columns(2)
+    # --- Section 1: KPIs ---
+    st.header("📊 Key Performance Indicators")
+    kpi_cols = st.columns(5)
+    kpi_cols[0].metric("Total Orders", f"{total_orders_main:,}")
+    
+    confirmed = kpis.get("Confirmed", 0)
+    kpi_cols[1].metric("Confirmed", f"{confirmed:,}", f"{confirmed/total_orders_main:.1%}" if total_orders_main else "0%",
+                       help="Orders confirmed by calling team.")
 
-    # --- Pie Chart: High-Level Order Funnel ---
-    with chart_cols1[0]:
-        st.markdown("**Order Funnel Status**")
-        # Use summary values preferentially
-        delivered = summary_data.get('Total Delivered (Summary)', 0)
-        rto = summary_data.get('Total RTO (Summary)', 0)
-        dispatched = summary_data.get('Total Dispatched (Summary)', 0) # 'Dispatched' includes Delivered+RTO+InTransit
-        cancelled = summary_data.get('Total Cancelled (Summary)', 0)
-        in_progress = summary_data.get('Calling In Progress (Summary)', 0) # May need adjustment based on label
+    dispatched = kpis.get("Dispatched", 0)
+    kpi_cols[2].metric("Dispatched", f"{dispatched:,}", f"{dispatched/total_orders_main:.1%}" if total_orders_main else "0%",
+                       help="Total orders handed over for delivery (includes In-Transit, Delivered, RTO initiated).")
+    
+    delivered = kpis.get("Delivered", 0)
+    kpi_cols[3].metric("Delivered", f"{delivered:,}", f"{delivered/total_orders_main:.1%}" if total_orders_main else "0%",
+                       delta_color="inverse", help="Successfully delivered to customer.")
+    
+    cancelled = kpis.get("Cancelled", 0) # Using the most reliable 'Cancelled' figure
+    kpi_cols[4].metric("Cancelled", f"{cancelled:,}", f"{-cancelled/total_orders_main:.1%}" if total_orders_main else "0%", # Negative for loss
+                       delta_color="normal", help="Orders cancelled before or after confirmation.")
+    
+    st.markdown("---")
 
-        # Estimate 'In Transit' if possible: Dispatched - Delivered - RTO
-        in_transit_est = max(0, dispatched - delivered - rto) # Ensure non-negative
+    # --- Section 2: Order Lifecycle Funnel & Calling Insights ---
+    st.header("📞 Calling Performance & Order Lifecycle")
+    lc_cols = st.columns([2, 1]) # 2/3 for funnel, 1/3 for calling stats
 
-        # Estimate 'Pending / New / Confirmation'
-        pending_new = max(0, total_orders - (delivered + rto + in_transit_est + cancelled + in_progress))
+    with lc_cols[0]:
+        st.subheader("Order Lifecycle Funnel")
+        # Define funnel stages based on available data
+        # This needs careful thought based on your process flow
+        total_orders = kpis.get("Total Orders", 0)
+        confirmed = kpis.get("Confirmed", 0) # Confirmed by calling
+        dispatched = kpis.get("Dispatched",0) # From summary block F
+        delivered = kpis.get("Delivered",0) # From block A or F
+        rto = kpis.get("RTO",0)
 
-        funnel_data = {
-            'Status': ['Delivered', 'RTO', 'In Transit (Est.)', 'Cancelled', 'Calling In Progress', 'Pending/New'],
-            'Count': [delivered, rto, in_transit_est, cancelled, in_progress, pending_new]
+        # Calculate intermediate/loss stages for the funnel
+        pending_confirmation = call_statuses.get("Confirmation Pending", 0) + \
+                               call_statuses.get("Call didn't Pick",0) + \
+                               call_statuses.get("Follow Up",0) + \
+                               kpis.get("Call In Progress",0)
+        
+        # Ensure this isn't double counting with 'Cancelled' KPI
+        cancelled_pre_dispatch = call_statuses.get("Cancelled", 0) # Assuming this is pre-dispatch cancel
+
+        # Dispatched but not yet delivered or RTO'd = In Transit / Out for Delivery
+        in_transit_ofd = max(0, dispatched - delivered - rto)
+
+
+        funnel_stages = [
+            go.Funnel(
+                name="Main Funnel",
+                y=["Total Orders", "Pending Confirmation", "Confirmed", "Dispatched", "In Transit/OFD", "Delivered"],
+                x=[total_orders_main, pending_confirmation, confirmed, dispatched, in_transit_ofd, delivered],
+                textposition="inside",
+                textinfo="value+percent initial",
+                opacity=0.65,
+                marker={"color": ["deepskyblue", "lightsalmon", "tan", "teal", "silver","lightgreen"]},
+                connector={"line": {"color": "royalblue", "dash": "dot", "width": 3}}
+            )
+        ]
+        # You can add another trace for losses (e.g., Cancelled at each stage)
+        losses_x = [total_orders - pending_confirmation, pending_confirmation - confirmed, confirmed - dispatched, dispatched - in_transit_ofd, in_transit_ofd - delivered]
+        losses_y = ["Lost Pre-Confirm", "Lost Pre-Dispatch", "Lost Pre-Transit", "Lost Pre-Delivery", "RTO/Lost In-Transit"]
+
+        fig_funnel = go.Figure(funnel_stages)
+        fig_funnel.update_layout(
+            title_text="Order Processing Funnel",
+            margin=dict(l=50, r=50, t=50, b=20),
+            height=450
+        )
+        st.plotly_chart(fig_funnel, use_container_width=True)
+
+    with lc_cols[1]:
+        st.subheader("Calling Team Status")
+        # Data for pie chart - focus on actionable calling statuses
+        calling_pie_data = {
+            "Confirmation Pending": call_statuses.get("Confirmation Pending",0),
+            "Call didn't Pick": call_statuses.get("Call didn't Pick",0),
+            "Follow Up": call_statuses.get("Follow Up",0),
+            "Number Invalid/Fake": call_statuses.get("Number invalid/fake order",0),
+            "Whatsapp Sent": call_statuses.get("Whatsapp msg-sent",0),
+            # "Confirmed by Call": call_statuses.get("Confirmed",0) # Already a KPI
         }
-        df_funnel = pd.DataFrame(funnel_data)
-        df_funnel = df_funnel[df_funnel['Count'] > 0] # Only plot categories with counts
+        df_calling_pie = pd.DataFrame(list(calling_pie_data.items()), columns=['Status', 'Count'])
+        df_calling_pie = df_calling_pie[df_calling_pie['Count'] > 0]
 
-        if not df_funnel.empty:
-            fig_funnel = px.pie(df_funnel, names='Status', values='Count',
-                                title="High-Level Order Status", hole=0.4)
-            fig_funnel.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=400)
-            st.plotly_chart(fig_funnel, use_container_width=True)
+        if not df_calling_pie.empty:
+            fig_pie_call = px.pie(df_calling_pie, names='Status', values='Count', hole=0.4,
+                                  title="Current Calling Pipeline")
+            fig_pie_call.update_traces(textposition='inside', textinfo='percent+label')
+            fig_pie_call.update_layout(legend_title_text='Calling Statuses', height=450, margin=dict(t=50))
+            st.plotly_chart(fig_pie_call, use_container_width=True)
         else:
-            st.info("Insufficient data for Funnel Status chart.")
-
-    # --- Pie Chart: COD vs Prepaid ---
-    with chart_cols1[1]:
-        st.markdown("**Payment Method**")
-        cod_count = summary_data.get('Cod Orders', 0) # Using parsed key
-        prepaid_count = summary_data.get('Prepaid Orders', summary_data.get('Prepaid',0)) # Use specific key or fallback
-
-        if cod_count > 0 or prepaid_count > 0:
-            payment_data = {'Method': ['COD', 'Prepaid'], 'Count': [cod_count, prepaid_count]}
-            df_payment = pd.DataFrame(payment_data)
-            fig_payment = px.pie(df_payment, names='Method', values='Count',
-                                 title="COD vs. Prepaid Orders", hole=0.4,
-                                 color_discrete_map={'COD':'skyblue', 'Prepaid':'lightgreen'})
-            fig_payment.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=400)
-            st.plotly_chart(fig_payment, use_container_width=True)
-        else:
-            st.info("No COD/Prepaid data found.")
-
-    st.markdown("---") # Separator
-
-    # --- Charts Row 2 ---
-    st.markdown("#### Detailed Statuses")
-    chart_cols2 = st.columns(2)
-
-    # --- Bar Chart: Calling / Initial Status ---
-    with chart_cols2[0]:
-        st.markdown("**Calling Status (Initial)**")
-        call_status_metrics = [
-            "Confirmation Pending", "Call didn't Pick", "Number invalid/fake order",
-            "Follow Up", "Whatsapp msg-sent"
-            # Add others from Col A if relevant like "Confirmed", "Cancelled" pre-fulfillment
-        ]
-        call_status_data = {metric: summary_data.get(metric, 0) for metric in call_status_metrics}
-        # Add Confirmed/Cancelled counts if they primarily represent pre-dispatch outcomes
-        call_status_data["Confirmed (Pre-Dispatch?)"] = summary_data.get('Confirmed', 0)
-        call_status_data["Cancelled (Pre-Dispatch?)"] = summary_data.get('Cancelled', 0)
-
-        df_call_status = pd.DataFrame(list(call_status_data.items()), columns=['Status', 'Count'])
-        df_call_status = df_call_status[df_call_status['Count'] > 0].sort_values('Count', ascending=False)
-
-        if not df_call_status.empty:
-            fig_call = px.bar(df_call_status, x='Status', y='Count', title="Calling & Initial Status Counts")
-            fig_call.update_layout(yaxis_title="Number of Orders", height=400)
-            st.plotly_chart(fig_call, use_container_width=True)
-        else:
-            st.info("No detailed calling status data found.")
-
-    # --- Bar Chart: Fulfillment Status ---
-    with chart_cols2[1]:
-        st.markdown("**Fulfillment / Post-Dispatch Status**")
-        fulfillment_metrics = [
-            "Delivered", "Out for delivery", "In-transit", "Pending Pick up",
-            "NDR", "RTO", "Pending To Be Dispatch", "Cancel" # Note: Cancel might be pre or post dispatch
-        ]
-        fulfillment_data = {metric: summary_data.get(metric, 0) for metric in fulfillment_metrics}
-        df_fulfillment = pd.DataFrame(list(fulfillment_data.items()), columns=['Status', 'Count'])
-        df_fulfillment = df_fulfillment[df_fulfillment['Count'] > 0].sort_values('Count', ascending=False)
-
-        if not df_fulfillment.empty:
-            fig_fulfill = px.bar(df_fulfillment, x='Status', y='Count', title="Fulfillment & Post-Dispatch Status Counts")
-            fig_fulfill.update_layout(yaxis_title="Number of Orders", height=400)
-            st.plotly_chart(fig_fulfill, use_container_width=True)
-        else:
-            st.info("No detailed fulfillment status data found.")
-
+            st.info("No active calling pipeline data.")
 
     st.markdown("---")
-    st.caption("Note: Chart data is parsed directly from the 'Summery' sheet. Ensure the sheet format and labels are consistent.")
 
-elif service:
-    st.warning("Could not load or parse data from the Summary sheet. Please check sheet name, format, and permissions.")
+    # --- Section 3: Fulfillment Insights ---
+    st.header("🚚 Fulfillment & Dispatch Overview")
+    ff_cols = st.columns(2)
+
+    with ff_cols[0]:
+        st.subheader("Current Shipment Statuses")
+        # Focus on post-dispatch statuses
+        shipment_data = {
+            "Delivered": fulfillment_statuses.get("Delivered", 0),
+            "Out for Delivery": fulfillment_statuses.get("Out for delivery", 0),
+            "In-Transit": fulfillment_statuses.get("In-transit", 0),
+            "Pending Pick up": fulfillment_statuses.get("Pending Pick up", 0),
+            "RTO (Post-Dispatch)": kpis.get("RTO", 0), # Using cleaned RTO KPI
+            "Pending To Be Dispatch": high_level.get("Total Pending To Dispatch", fulfillment_statuses.get("Pending To Be Dispatch",0))
+        }
+        df_shipment = pd.DataFrame(list(shipment_data.items()), columns=['Status', 'Count'])
+        df_shipment = df_shipment[df_shipment['Count'] > 0].sort_values(by="Count", ascending=False)
+
+        if not df_shipment.empty:
+            fig_shipment = px.bar(df_shipment, x="Status", y="Count", color="Status",
+                                  title="Shipment Progress",
+                                  labels={"Count": "Number of Orders"})
+            fig_shipment.update_layout(xaxis_title="", yaxis_title="Orders", showlegend=False, height=400)
+            st.plotly_chart(fig_shipment, use_container_width=True)
+        else:
+            st.info("No shipment status data to display.")
+
+    with ff_cols[1]:
+        st.subheader("Non-Delivery Reasons")
+        non_delivery_data = {
+            "Cancelled": kpis.get("Cancelled", 0), # Overall cancelled
+            "RTO": kpis.get("RTO", 0),
+            "Invalid/Fake Order": call_statuses.get("Number invalid/fake order", 0),
+            "NDR (Calling)": call_statuses.get("NDR", 0) # Assuming this is from calling stage
+        }
+        df_non_delivery = pd.DataFrame(list(non_delivery_data.items()), columns=['Reason', 'Count'])
+        df_non_delivery = df_non_delivery[df_non_delivery['Count'] > 0]
+
+        if not df_non_delivery.empty:
+            fig_non_delivery = px.pie(df_non_delivery, names='Reason', values='Count', hole=0.4,
+                                      title="Reasons for Non-Delivery/Cancellation")
+            fig_non_delivery.update_traces(textposition='inside', textinfo='percent+label')
+            fig_non_delivery.update_layout(legend_title_text='Reasons', height=400, margin=dict(t=50))
+            st.plotly_chart(fig_non_delivery, use_container_width=True)
+        else:
+            st.info("No data for non-delivery reasons.")
+            
+    st.markdown("---")
+    # --- Data Table (Optional - for detailed view) ---
+    with st.expander("View Raw Parsed Summary Data"):
+        st.json(parsed_summary_data) # Display all parsed data for debugging/verification
+
 else:
-    st.error("Google Sheets Authentication failed. Cannot load summary data.")
+    if service and not error_msg: # Service connected but parsing failed somehow (should be caught by error_msg)
+        st.warning("Summary data loaded but could not be parsed into a displayable format. Check parsing logic and sheet structure.")
 
-# --- Add link to other pages (Optional footer) ---
+# --- Footer ---
 st.sidebar.markdown("---")
-st.sidebar.info("Navigate using the options above.")
+st.sidebar.info("Dashboard showing CRM summary. Navigate using options above for other tools.")

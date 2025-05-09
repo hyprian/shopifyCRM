@@ -4,368 +4,398 @@ import streamlit as st
 import pandas as pd
 import datetime
 import plotly.express as px
+import plotly.graph_objects as go # For more advanced charts
 import sys
 from pathlib import Path
-import re # For parsing the breakdown string
+import re
 
-# --- Google Sheets Authentication (Simplified for Streamlit page) ---
-# Add necessary imports from the other scripts if needed
+# --- Project Setup & Constants ---
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+sys.path.append(str(PROJECT_ROOT))
+
+SERVICE_ACCOUNT_FILE = PROJECT_ROOT / 'molten-medley-458604-j9-855f3bdefd90.json' # Ensure filename
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+PERFORMANCE_REPORT_SHEET_NAME = 'Performance Reports' # From performance_analyzer.py
+
+# --- Google Sheets Authentication & Data Loading (from your provided script) ---
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Assume PROJECT_ROOT and necessary constants are accessible or redefined
-# If running as part of a larger streamlit app, these might be inherited
-# If running standalone, define them here.
-try:
-    # Try importing from a potential utils script or the main dashboard script
-    # This assumes your project structure allows finding 'authenticate_google_sheets'
-    # You might need to adjust sys.path or import structure
-    # Example: Add project root to path if pages are nested
-    PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-    sys.path.append(str(PROJECT_ROOT))
-    # Attempt to import from distributionV2 (might be messy) or a dedicated utils.py
-    # For simplicity here, we'll redefine a minimal auth function
-    # Ideally, refactor auth to a shared utils.py
-except ImportError:
-    st.error("Could not configure project paths correctly. Ensure structure allows imports.")
-    st.stop()
+@st.cache_data(show_spinner=False)
+def load_settings_for_spreadsheet_id():
+    try:
+        import yaml
+        SETTINGS_FILE = PROJECT_ROOT / 'settings.yaml'
+        with open(SETTINGS_FILE, 'r') as f:
+            settings_config = yaml.safe_load(f)
+        return settings_config['sheets']['orders_spreadsheet_id']
+    except Exception as e:
+        st.error(f"Critical Error: Could not load ORDERS_SPREADSHEET_ID from settings.yaml: {e}")
+        return None
 
-# Constants (should ideally come from settings or a central config)
-SERVICE_ACCOUNT_FILE = PROJECT_ROOT / 'molten-medley-458604-j9-855f3bdefd90.json'
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'] # READONLY scope is enough here
-PERFORMANCE_REPORT_SHEET_NAME = 'Performance Reports'
-# Assume ORDERS_SPREADSHEET_ID is known or loaded from settings
-# For this example, let's hardcode it - replace with settings loading
-try:
-    import yaml
-    SETTINGS_FILE = PROJECT_ROOT / 'settings.yaml'
-    with open(SETTINGS_FILE, 'r') as f:
-        settings = yaml.safe_load(f)
-    ORDERS_SPREADSHEET_ID = settings['sheets']['orders_spreadsheet_id']
-except Exception as e:
-    st.error(f"Error loading ORDERS_SPREADSHEET_ID from settings.yaml: {e}")
-    ORDERS_SPREADSHEET_ID = "YOUR_SPREADSHEET_ID_HERE" # Fallback placeholder
-    st.warning(f"Using fallback Spreadsheet ID: {ORDERS_SPREADSHEET_ID}. Please ensure settings.yaml is correct.")
+ORDERS_SPREADSHEET_ID = load_settings_for_spreadsheet_id()
 
-
-# --- Authentication Function (Streamlit Specific) ---
-@st.cache_resource(ttl=3600) # Cache resource for 1 hour
-def authenticate_google_sheets_st():
-    """Authenticates using Streamlit secrets or local service account file."""
+@st.cache_resource(ttl=3600)
+def authenticate_google_sheets_st_perf(): # Renamed to avoid conflict if imported elsewhere
     creds = None
     try:
-        # Prioritize Streamlit secrets if available
         creds_info = st.secrets["GOOGLE_CREDENTIALS"].to_dict()
-        st.info("Using Streamlit secrets for authentication.")
-        creds = service_account.Credentials.from_service_account_info(
-            creds_info, scopes=SCOPES)
+        creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     except Exception:
-        # st.info("Streamlit secrets not found. Falling back to local service account file.")
         try:
-            creds = service_account.Credentials.from_service_account_file(
-                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        except FileNotFoundError:
-            st.error(f"Service account file not found at: {SERVICE_ACCOUNT_FILE}")
-            return None
+            creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         except Exception as e:
-            st.error(f"Error loading credentials from file: {e}")
+            st.error(f"Perf Report Auth Error: {e}")
             return None
+    if creds is None: return None
+    return build('sheets', 'v4', credentials=creds)
 
-    if creds is None:
-        st.error("Authentication failed. Could not load credentials.")
-        return None
-
+# --- NEW: Robust Parser for the Text-Based Performance Report Sheet ---
+@st.cache_data(ttl=300, show_spinner="Loading performance data...")
+def load_and_parse_text_performance_report(_service, spreadsheet_id, sheet_name):
+    if not _service: return pd.DataFrame(), [], "Authentication service not available."
+    
+    all_records = []
+    available_dates = set()
+    
     try:
-        service = build('sheets', 'v4', credentials=creds)
-        # st.success("Google Sheets authenticated successfully.")
-        return service
-    except HttpError as e:
-        st.error(f"API Error building Sheets service: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Unexpected error building Sheets service: {e}")
-        return None
-
-@st.cache_data(ttl=300) # Reduce cache time during debugging
-def load_and_parse_performance_data(_service, spreadsheet_id, sheet_name):
-    """Reads the performance report sheet and parses it into a DataFrame (Simplified Logic)."""
-    # st.info(f"Attempting to load data from sheet: '{sheet_name}'")
-    if not _service:
-        st.error("Authentication service not available.")
-        return pd.DataFrame(), []
-
-    try:
-        read_range = f"'{sheet_name}'!A:J" # Read wide
-        # st.info(f"Reading range: {read_range}")
+        # Read a wider range to ensure all data for a day's report is captured.
+        # The report seems to be appended, so this needs to be large enough for many days or we read all.
+        # For simplicity in parsing, let's read a large chunk.
+        # Adjust 'A:J' if your breakdown strings get very long.
+        range_to_read = f"'{sheet_name}'!A1:J" # Read up to column J, all rows
         result = _service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=read_range
+            range=range_to_read
         ).execute()
         values = result.get('values', [])
-        # st.info(f"Read {len(values)} rows from the sheet.")
     except HttpError as e:
-        st.error(f"API Error reading sheet '{sheet_name}': {e}")
-        # ... (error handling for auth) ...
-        return pd.DataFrame(), []
+        return pd.DataFrame(), [], f"API Error reading performance sheet '{sheet_name}': {e}"
     except Exception as e:
-        st.error(f"Unexpected error reading sheet '{sheet_name}': {e}")
-        return pd.DataFrame(), []
+        return pd.DataFrame(), [], f"Unexpected error reading performance sheet '{sheet_name}': {e}"
 
     if not values:
-        st.warning(f"No data found in performance report sheet: '{sheet_name}'")
-        return pd.DataFrame(), []
+        return pd.DataFrame(), [], f"No data found in performance report sheet: '{sheet_name}'."
 
-    parsed_data = []
-    available_dates = set()
-    current_date = None
+    current_date_str = None
     current_stakeholder = None
+    # Categories that mark a data row (excluding TOTAL)
+    data_row_categories = ["Fresh", "Abandoned", "Invalid/Fake", "CNP", "Follow up", "NDR"]
+
+    for row_num, row_cells in enumerate(values):
+        if not row_cells or not any(str(c).strip() for c in row_cells): continue # Skip empty rows
+
+        cell_a = str(row_cells[0]).strip()
+
+        # Detect Report Date
+        if cell_a.startswith("--- Stakeholder Performance Report for"):
+            match_date = re.search(r"for\s+(.+?)\s+---", cell_a)
+            if match_date:
+                current_date_str = match_date.group(1).strip()
+                available_dates.add(current_date_str)
+                current_stakeholder = None # Reset stakeholder for new report block
+            continue
+        
+        # Detect Stakeholder Block
+        if cell_a.startswith("Stakeholder:"):
+            current_stakeholder = cell_a.replace("Stakeholder:", "").strip()
+            continue
+
+        # Detect Header Row for categories (and skip it)
+        if cell_a == "Initial Category" and len(row_cells) > 1 and str(row_cells[1]).strip() == "Assigned Today":
+            continue
+        
+        # Detect Separator lines (and skip them)
+        if cell_a.startswith("------------------"):
+            continue
+
+        # Parse Data Rows
+        if current_date_str and current_stakeholder and cell_a in data_row_categories:
+            if len(row_cells) >= 5: # Need at least Initial Cat, Assigned, Actioned, Pending, Breakdown
+                try:
+                    category = cell_a
+                    assigned = int(str(row_cells[1]).strip())
+                    actioned = int(str(row_cells[2]).strip())
+                    pending = int(str(row_cells[3]).strip())
+                    breakdown_raw = str(row_cells[4]).strip()
+
+                    record = {
+                        "Date": current_date_str,
+                        "Stakeholder": current_stakeholder,
+                        "Category": category,
+                        "Assigned": assigned,
+                        "Actioned": actioned,
+                        "Pending": pending,
+                        "RawBreakdown": breakdown_raw if breakdown_raw != '-' else ""
+                    }
+                    all_records.append(record)
+                except ValueError:
+                    # st.warning(f"Skipping row {row_num+1} for {current_stakeholder} on {current_date_str} due to number parsing error: {row_cells[:4]}")
+                    pass # Silently skip if a row within a stakeholder block isn't numeric as expected
+                except IndexError:
+                    # st.warning(f"Skipping row {row_num+1} for {current_stakeholder} on {current_date_str} due to not enough columns.")
+                    pass
+        
+        # Detect TOTAL row for a stakeholder (can be used for validation or overall numbers)
+        if current_date_str and current_stakeholder and cell_a == "TOTAL":
+            # Optionally parse totals here if needed for cross-checking
+            current_stakeholder = None # Reset stakeholder after their total block to avoid misattribution
+
+    if not all_records:
+        return pd.DataFrame(), sorted(list(available_dates), reverse=True), "No structured performance records parsed."
+
+    df = pd.DataFrame(all_records)
     
-    # Define expected categories to identify data rows
-    expected_categories = {"Fresh", "Abandoned", "Invalid/Fake", "CNP", "Follow up", "NDR"}
-
-    for i, row in enumerate(values):
-        # Uncomment below to see raw rows during debugging
-        # st.write(f"Processing Row {i+1}: {row}")
-
-        if not row or not any(str(c).strip() for c in row): continue # Skip blank rows
-
-        cell_a_value = str(row[0]).strip()
-
-        # --- Identify Context: Date and Stakeholder ---
-        report_header_prefix = "--- Stakeholder Performance Report for "
-        if cell_a_value.startswith(report_header_prefix):
-            match = re.search(r"for\s+(.+?)\s+---", cell_a_value)
-            if match:
-                current_date = match.group(1).strip()
-                available_dates.add(current_date)
-                current_stakeholder = None # Reset stakeholder when new date found
-            continue
-
-        stakeholder_prefix = "Stakeholder:"
-        if cell_a_value.startswith(stakeholder_prefix):
-            current_stakeholder = cell_a_value.replace(stakeholder_prefix, "").strip()
-            continue
-
-        # --- Attempt to Parse Data Rows Directly ---
-        # Check if we have date/stakeholder context AND if row looks like data
-        if current_date and current_stakeholder:
-            # Condition: First cell is one of the expected categories AND row has enough numeric-like columns
-            if cell_a_value in expected_categories and len(row) >= 4:
-                category = cell_a_value
-                assigned_str = str(row[1]).strip()
-                actioned_str = str(row[2]).strip()
-                pending_str = str(row[3]).strip()
-                breakdown_str = str(row[4]).strip() if len(row) > 4 else ""
-
-                # Check if the next few columns look like numbers
-                if assigned_str.isdigit() and actioned_str.isdigit() and pending_str.isdigit():
-                     # Uncomment below for debugging parsing attempts
-                     # st.write(f"  -> Looks like data row: {row[:5]}")
-                     try:
-                        assigned = int(assigned_str)
-                        actioned = int(actioned_str)
-                        pending = int(pending_str)
-
-                        parsed_data.append({
-                            "Date": current_date, "Stakeholder": current_stakeholder, "Category": category,
-                            "Assigned": assigned, "Actioned": actioned, "Pending": pending,
-                            "Breakdown": breakdown_str
-                        })
-                        # Uncomment below to confirm successful parsing
-                        # st.write(f"    -> Successfully parsed and added.")
-                     except ValueError:
-                          st.warning(f"Row {i+1}: Failed converting to int even after isdigit check (should not happen). Row: {row}")
-                          continue
-                # else:
-                     # Uncomment below to see why a potential data row was skipped
-                     # st.write(f"  -> Row {i+1} skipped: First cell matched category '{category}', but cols 2-4 not all digits ('{assigned_str}', '{actioned_str}', '{pending_str}').")
-
-
-    # st.info(f"Finished processing rows. Parsed {len(parsed_data)} data records using simplified logic.")
-
-    if not parsed_data:
-        st.warning("Simplified parsing logic also failed to extract structured data.")
-        if values:
-            st.subheader("Raw Data Snippet (First 20 Rows)")
-            st.dataframe(pd.DataFrame(values[:20]))
-        # ... (return empty df and sorted dates) ...
-        try:
-            sorted_dates = sorted(list(available_dates), key=lambda d: datetime.datetime.strptime(d, '%d-%b-%Y'), reverse=True)
-        except Exception:
-             sorted_dates = sorted(list(available_dates), reverse=True)
-        return pd.DataFrame(), sorted_dates
-
-    # --- Post-processing DataFrame ---
-    df = pd.DataFrame(parsed_data)
+    # Convert Date string to datetime for proper sorting later if needed by selectors
     try:
         df['Date_dt'] = pd.to_datetime(df['Date'], format='%d-%b-%Y')
-    except Exception:
-        st.warning("Could not parse all dates into datetime objects. Sorting may be alphabetical.")
-        df['Date_dt'] = df['Date']
+        # Sort available_dates chronologically (most recent first)
+        sorted_dates = sorted(list(available_dates), key=lambda d: datetime.datetime.strptime(d, '%d-%b-%Y'), reverse=True)
+    except ValueError: # Fallback if date format is inconsistent
+        st.warning("Some dates in the report could not be parsed correctly. Sorting may be alphabetical.")
+        df['Date_dt'] = df['Date'] # Keep as string
+        sorted_dates = sorted(list(available_dates), reverse=True) # Simple reverse sort
 
-    sorted_dates = sorted(list(available_dates), key=lambda d: datetime.datetime.strptime(d, '%d-%b-%Y'), reverse=True)
-    return df, sorted_dates
+    return df, sorted_dates, None # Data, Dates, Error Message
 
 
-# --- Streamlit Page Configuration & UI ---
-st.set_page_config(page_title="Performance Report", page_icon="📊", layout="wide")
-st.title("📊 Stakeholder Performance Report")
-st.markdown("View historical performance based on the generated daily reports.")
+# --- Helper to Parse Breakdown String ---
+def parse_breakdown_to_df(breakdown_series):
+    """ Parses the 'Final Status Breakdown (Actioned)' string into a count dictionary. """
+    all_status_counts = {}
+    for breakdown_str in breakdown_series:
+        if pd.isna(breakdown_str) or not breakdown_str.strip() or breakdown_str.strip() == '-':
+            continue
+        
+        # Regex to find "Status Name: Count" pairs, robust to variations
+        # Matches: "Status Name: Count", "Status Name : Count"
+        # It will also handle "Other Actioned (Orders): 21"
+        parts = breakdown_str.split(',')
+        for part in parts:
+            match = re.match(r"^\s*(.+?)\s*:\s*(\d+)\s*$", part.strip())
+            if match:
+                status_name = match.group(1).strip()
+                try:
+                    count = int(match.group(2))
+                    all_status_counts[status_name] = all_status_counts.get(status_name, 0) + count
+                except ValueError:
+                    pass # Ignore if count is not a number
+    
+    if not all_status_counts:
+        return pd.DataFrame(columns=['Final Status', 'Count'])
+        
+    return pd.DataFrame(list(all_status_counts.items()), columns=['Final Status', 'Count']).sort_values(by="Count", ascending=False)
 
-# --- Authentication ---
-service = authenticate_google_sheets_st()
 
-if service:
-    # --- Load and Parse Data ---
-    perf_df, report_dates = load_and_parse_performance_data(service, ORDERS_SPREADSHEET_ID, PERFORMANCE_REPORT_SHEET_NAME)
+# --- Page Styling (Optional) ---
+# st.markdown("""
+# <style>
+# /* Add custom CSS here if needed */
+# .stMetric {
+#     border: 1px solid #_placeholder;
+#     padding: 10px;
+#     border-radius: 5px;
+#     background-color: #f8f9fa;
+# }
+# </style>
+# """, unsafe_allow_html=True)
 
-    if not report_dates:
-        st.warning("No performance report dates found or parsed.")
-        st.stop()
-    if perf_df.empty:
-         st.warning("Dataframe is empty after parsing. Cannot display report.")
-         st.stop()
 
-    # --- Date Selection ---
-    selected_date = st.selectbox(
-        "Select Report Date:",
-        report_dates,
-        index=0 # Default to the latest date
+# --- Streamlit Page UI ---
+st.set_page_config(page_title="Stakeholder Performance", page_icon="🚀", layout="wide")
+st.title("🚀 Stakeholder Performance Dashboard")
+st.markdown("Analyze daily performance metrics and task outcomes.")
+st.markdown("---")
+
+# --- Authentication and Data Loading ---
+if not ORDERS_SPREADSHEET_ID:
+    st.error("Spreadsheet ID not loaded. Dashboard cannot proceed.")
+    st.stop()
+
+google_sheets_service = authenticate_google_sheets_st_perf()
+perf_df, report_dates, error_message = pd.DataFrame(), [], "Initializing..." # Default values
+
+if google_sheets_service:
+    perf_df, report_dates, error_message = load_and_parse_text_performance_report(
+        google_sheets_service, ORDERS_SPREADSHEET_ID, PERFORMANCE_REPORT_SHEET_NAME
     )
+else:
+    error_message = "Google Sheets authentication failed."
 
-    if selected_date:
-        df_filtered_date = perf_df[perf_df['Date'] == selected_date].copy()
+if error_message and not perf_df.empty: # Data loaded but there was a minor warning perhaps
+    st.info(error_message)
+elif error_message:
+    st.error(error_message)
+    st.stop()
 
-        if df_filtered_date.empty:
-            st.warning(f"No performance data parsed for the selected date: {selected_date}")
-            st.stop()
+if perf_df.empty:
+    st.warning("No performance data available to display.")
+    st.stop()
 
-        # --- Stakeholder Selection ---
-        stakeholder_list = sorted(df_filtered_date['Stakeholder'].unique())
-        all_stakeholders_option = "All Stakeholders"
-        # Use columns for better layout
-        col_filter1, col_filter2 = st.columns([1, 3]) # Adjust column ratios if needed
-        with col_filter1:
-            selected_stakeholder = st.selectbox(
-                "Select Stakeholder:",
-                [all_stakeholders_option] + stakeholder_list,
-                key="stakeholder_select" # Add unique key
+# --- Global Filters: Date and Stakeholder ---
+filter_cols = st.columns([1, 2, 1]) # Date, Stakeholder, (empty for spacing or future filter)
+selected_date = filter_cols[0].selectbox(
+    "📅 Select Report Date",
+    options=report_dates,
+    index=0,
+    help="Choose the date for which you want to view the performance report."
+)
+
+df_by_date = perf_df[perf_df['Date'] == selected_date].copy()
+
+if df_by_date.empty:
+    st.warning(f"No data found for selected date: {selected_date}")
+    st.stop()
+
+stakeholder_options = [None] + sorted(df_by_date['Stakeholder'].unique()) # Add "None" for overall view
+selected_stakeholder = filter_cols[1].selectbox(
+    "👤 Select Stakeholder (Optional)",
+    options=stakeholder_options,
+    format_func=lambda x: "Overall Team" if x is None else x,
+    index=0,
+    help="View performance for a specific stakeholder or the overall team."
+)
+
+# --- Filter Data Based on Selection ---
+if selected_stakeholder:
+    df_display = df_by_date[df_by_date['Stakeholder'] == selected_stakeholder].copy()
+    report_title_prefix = f"{selected_stakeholder}'s"
+else:
+    df_display = df_by_date.copy() # For overall, we'll aggregate
+    report_title_prefix = "Overall Team"
+
+st.header(f"{report_title_prefix} Performance Summary – {selected_date}")
+
+if df_display.empty and selected_stakeholder: # Check if a specific stakeholder had no data for that date
+    st.info(f"No data found for {selected_stakeholder} on {selected_date}.")
+    st.stop()
+elif df_display.empty:
+     st.info(f"No data found for {selected_date}.") # Should be caught earlier by df_by_date check
+     st.stop()
+
+
+# --- KPIs / Metrics Section ---
+# Aggregate if "Overall Team" is selected
+if not selected_stakeholder: # Overall view
+    kpi_assigned = df_display['Assigned'].sum()
+    kpi_actioned = df_display['Actioned'].sum()
+    kpi_pending = df_display['Pending'].sum()
+else: # Single stakeholder view
+    kpi_assigned = df_display['Assigned'].sum()
+    kpi_actioned = df_display['Actioned'].sum()
+    kpi_pending = df_display['Pending'].sum()
+
+action_rate = (kpi_actioned / kpi_assigned * 100) if kpi_assigned > 0 else 0
+
+kpi_cols_main = st.columns(4)
+kpi_cols_main[0].metric("Total Assigned", f"{kpi_assigned:,}", help="Total tasks assigned from the daily distribution.")
+kpi_cols_main[1].metric("Total Actioned", f"{kpi_actioned:,}", help="Tasks whose status changed from the initial assignment.")
+kpi_cols_main[2].metric("Action Rate", f"{action_rate:.1f}%", help="(Actioned / Assigned) * 100")
+kpi_cols_main[3].metric("Total Pending", f"{kpi_pending:,}", help="Tasks still in their initial assigned state.")
+st.markdown("---")
+
+
+# --- Detailed Breakdown and Visualizations ---
+st.subheader("Performance Details by Initial Category")
+
+# If overall, group by category first
+if not selected_stakeholder:
+    df_category_summary = df_display.groupby("Category")[["Assigned", "Actioned", "Pending"]].sum().reset_index()
+else:
+    df_category_summary = df_display[["Category", "Assigned", "Actioned", "Pending"]] # Already filtered
+
+# Melt for grouped bar chart
+df_melt = df_category_summary.melt(
+    id_vars=['Category'],
+    value_vars=['Actioned', 'Pending'], # Focus on outcome
+    var_name='Status',
+    value_name='Count'
+)
+# Add Assigned back for context if needed, or plot separately
+df_assigned_for_chart = df_category_summary[["Category", "Assigned"]]
+
+
+col_chart1, col_chart2 = st.columns(2)
+
+with col_chart1:
+    st.markdown("**Task Status by Initial Category**")
+    if not df_melt.empty:
+        fig_cat_status = px.bar(
+            df_melt,
+            x='Category',
+            y='Count',
+            color='Status',
+            barmode='group',
+            title="Actioned vs. Pending Tasks",
+            labels={"Count": "Number of Tasks", "Category": "Initial Assignment Category"},
+            color_discrete_map={'Actioned': 'mediumseagreen', 'Pending': 'coral'}
+        )
+        fig_cat_status.update_layout(legend_title_text='Task Status', height=450)
+        st.plotly_chart(fig_cat_status, use_container_width=True)
+    else:
+        st.info("No data to display for category status breakdown.")
+
+with col_chart2:
+    st.markdown("**Overall Actioned vs. Pending Distribution**")
+    if kpi_actioned > 0 or kpi_pending > 0:
+        df_pie_overall = pd.DataFrame({
+            'Status': ['Actioned', 'Pending'],
+            'Count': [kpi_actioned, kpi_pending]
+        })
+        fig_pie_overall = px.pie(df_pie_overall, names='Status', values='Count',
+                                 title="Overall Task Completion", hole=0.5,
+                                 color_discrete_map={'Actioned': 'mediumseagreen', 'Pending': 'coral'})
+        fig_pie_overall.update_traces(textinfo='percent+label')
+        fig_pie_overall.update_layout(height=450, margin=dict(t=50)) # legend_title_text='Overall Status',
+        st.plotly_chart(fig_pie_overall, use_container_width=True)
+    else:
+        st.info("No overall actioned or pending data.")
+
+st.markdown("---")
+
+# --- Final Status Breakdown of Actioned Tasks ---
+st.subheader("Outcomes of Actioned Tasks")
+if kpi_actioned > 0:
+    # Aggregate RawBreakdown strings if 'Overall Team'
+    if not selected_stakeholder:
+        actioned_breakdowns_series = df_display[df_display['Actioned'] > 0]['RawBreakdown']
+    else:
+        actioned_breakdowns_series = df_display[df_display['Actioned'] > 0]['RawBreakdown']
+        
+    df_final_statuses = parse_breakdown_to_df(actioned_breakdowns_series)
+
+    if not df_final_statuses.empty:
+        # Show as a bar chart
+        fig_final_breakdown_bar = px.bar(
+            df_final_statuses,
+            x="Final Status",
+            y="Count",
+            color="Final Status",
+            title=f"Final Statuses for {kpi_actioned} Actioned Tasks",
+            labels={"Count": "Number of Tasks"}
+        )
+        fig_final_breakdown_bar.update_layout(showlegend=False, height=450, xaxis_tickangle=-45)
+        st.plotly_chart(fig_final_breakdown_bar, use_container_width=True)
+
+        # Option to show as a treemap for a different visual
+        with st.expander("View Final Statuses as Treemap & Table"):
+            fig_final_treemap = px.treemap(
+                df_final_statuses,
+                path=[px.Constant("All Actioned"), 'Final Status'],
+                values='Count',
+                title="Treemap of Final Statuses"
             )
-
-        # --- Filter by Stakeholder ---
-        if selected_stakeholder == all_stakeholders_option:
-            df_display = df_filtered_date
-            title_level = "Overall"
-        else:
-            df_display = df_filtered_date[df_filtered_date['Stakeholder'] == selected_stakeholder]
-            title_level = f"for {selected_stakeholder}"
-
-        st.subheader(f"{title_level} Performance Summary ({selected_date})")
-
-        if df_display.empty:
-            st.warning("No data available for the current selection.")
-            st.stop()
-
-        # --- Display Key Metrics in Boxes (Columns) ---
-        total_assigned = df_display['Assigned'].sum()
-        total_actioned = df_display['Actioned'].sum()
-        total_pending = df_display['Pending'].sum()
-        
-        # Calculate totals from assignment report for comparison (more accurate 'Assigned')
-        # This requires parsing the TOTAL line or summing categories from the df
-        # For now, use the sum from the parsed df rows
-        # assigned_from_report = # Need to parse TOTAL row if available or sum categories
-
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("Assigned Today", f"{total_assigned:,}") # Format with comma
-        metric_cols[1].metric("Actioned Today", f"{total_actioned:,}")
-        metric_cols[2].metric("Pending Today", f"{total_pending:,}")
-        
-        # Optional: Show discrepancy if calculated assigned differs from report's total line
-        # calculated_assigned_sum = total_actioned + total_pending # Check this sum
-        # if assigned_from_report and assigned_from_report != calculated_assigned_sum:
-        #     st.caption(f"Note: Assigned total from report was {assigned_from_report}. Discrepancy: {assigned_from_report-calculated_assigned_sum}")
-
-
-        st.markdown("---") # Separator
-
-        # --- Visualizations ---
-        st.subheader("Visualizations")
-
-        viz_cols = st.columns(2)
-
-        with viz_cols[0]:
-            st.markdown("**Performance by Initial Category**")
-            if not df_display.empty:
-                # Group data by category for charting
-                df_grouped = df_display.groupby('Category')[['Assigned', 'Actioned', 'Pending']].sum().reset_index()
-                df_melt = df_grouped.melt(
-                    id_vars=['Category'],
-                    value_vars=['Actioned', 'Pending'], # Chart actioned/pending only
-                    var_name='Status',
-                    value_name='Count'
-                )
-                fig_bar = px.bar(df_melt, x='Category', y='Count', color='Status',
-                                 barmode='group', # Use group instead of stack for clearer comparison? or 'stack'
-                                 title="Actioned vs. Pending by Category",
-                                 color_discrete_map={'Actioned':'#1f77b4', 'Pending':'#ff7f0e'}) # Example colors
-                fig_bar.update_layout(yaxis_title="Number of Tasks", height=400)
-                st.plotly_chart(fig_bar, use_container_width=True)
-            else:
-                st.info("No category data to display.")
-
-        with viz_cols[1]:
-            st.markdown("**Actioned vs. Pending (Overall)**")
-            if total_actioned > 0 or total_pending > 0:
-                df_pie = pd.DataFrame({
-                    'Status': ['Actioned', 'Pending'],
-                    'Count': [total_actioned, total_pending]
-                })
-                fig_pie = px.pie(df_pie, names='Status', values='Count', hole=0.4,
-                                 title="Overall Actioned/Pending Ratio",
-                                 color_discrete_map={'Actioned':'#1f77b4', 'Pending':'#ff7f0e'})
-                fig_pie.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=400)
-                st.plotly_chart(fig_pie, use_container_width=True)
-            else:
-                st.info("No actioned or pending tasks.")
-
-        # --- Final Status Breakdown Chart ---
-        if total_actioned > 0:
-            st.markdown("---")
-            st.subheader("Final Status Breakdown (Actioned Tasks)")
-            final_status_counts = {}
-            for breakdown_string in df_display[df_display['Actioned'] > 0]['Breakdown']:
-                if breakdown_string and breakdown_string != '-':
-                    parts = breakdown_string.split(',')
-                    for part in parts:
-                         match = re.match(r"^\s*(.+?)\s*:\s*(\d+)\s*$", part.strip())
-                         if match:
-                             status = match.group(1).strip()
-                             try:
-                                 count = int(match.group(2).strip())
-                                 final_status_counts[status] = final_status_counts.get(status, 0) + count
-                             except ValueError: pass # Ignore if count isn't integer
-            
-            if final_status_counts:
-                df_final_status = pd.DataFrame(list(final_status_counts.items()), columns=['Final Status', 'Count'])
-                df_final_status = df_final_status[df_final_status['Count'] > 0] # Only show statuses with counts > 0
-                df_final_status = df_final_status.sort_values(by='Count', ascending=False)
-
-                if not df_final_status.empty:
-                    fig_final = px.bar(df_final_status, x='Final Status', y='Count',
-                                       title="Breakdown of Actioned Task Outcomes")
-                    fig_final.update_layout(yaxis_title="Number of Tasks")
-                    st.plotly_chart(fig_final, use_container_width=True)
-                else:
-                    st.info("No final statuses with counts > 0 found in breakdown.")
-            else:
-                st.info("No detailed final status breakdown available or could not parse strings.")
-        else:
-             st.info("No tasks were actioned for the selected scope.")
+            fig_final_treemap.update_layout(margin = dict(t=50, l=25, r=25, b=25))
+            st.plotly_chart(fig_final_treemap, use_container_width=True)
+            st.dataframe(df_final_statuses.set_index("Final Status"), use_container_width=True)
 
     else:
-        st.info("Select a date to view the performance report.")
-
+        st.info("No detailed final status breakdown available for actioned tasks, or breakdown strings were empty/unparsable.")
 else:
-    st.warning("Google Sheets Authentication failed.")
+    st.info("No tasks were actioned in the selected scope to show final status breakdown.")
+
+
+# --- Display Raw Filtered Data (Optional) ---
+with st.expander("View Filtered Data Table"):
+    st.dataframe(df_display.drop(columns=['Date_dt'], errors='ignore'), use_container_width=True)
