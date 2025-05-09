@@ -6,6 +6,7 @@ import pandas as pd
 import logging
 import sys
 import json # Though not used yet, good to have for future flexibility
+from pathlib import Path
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -14,6 +15,9 @@ from google.auth.exceptions import RefreshError
 # --- Configuration ---
 SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-855f3bdefd90.json' # Make sure this is correct
+
+PROJECT_ROOT_PERF_ANALYZER = Path(__file__).parent.resolve() # if in project root
+LAST_PERF_RUN_TIMESTAMP_FILE = PROJECT_ROOT_PERF_ANALYZER / "last_perf_run.txt"
 
 # Scopes required for reading and writing
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
@@ -680,17 +684,18 @@ def process_abandoned_sheet_for_actions(service, spreadsheet_id, today_date_form
 def format_and_write_performance_report(service, settings, performance_summary, today_date_str_display):
     """
     Formats the performance data and writes it to the specified Google Sheet.
+    Returns True if writing was successful, False otherwise.
     """
     logger.info(f"--- Formatting and Writing Performance Report for {today_date_str_display} ---")
     
     spreadsheet_id = settings['sheets']['orders_spreadsheet_id'] # Report goes to Orders sheet
     report_sheet_name = PERFORMANCE_REPORT_SHEET_NAME # e.g., "Performance Reports"
-    sheet = service.spreadsheets()
+    sheet_api = service.spreadsheets() # Use a different variable name for clarity
     
     stakeholder_names = list(performance_summary.keys())
-    
     formatted_values = []
-    
+    sheet_update_successful = False # Initialize success flag
+
     # --- Report Header ---
     formatted_values.append([f"--- Stakeholder Performance Report for {today_date_str_display} ---"])
     formatted_values.append(["Date:", today_date_str_display])
@@ -699,165 +704,131 @@ def format_and_write_performance_report(service, settings, performance_summary, 
     # --- Data for each Stakeholder ---
     for name in stakeholder_names:
         summary = performance_summary[name]
-        assigned_total_from_report = summary.get('assigned_total', 0) # Use total read from assignment report
+        assigned_total_from_report = summary.get('assigned_total', 0)
         actioned_total_calculated = summary.get('actioned_total', 0)
         pending_total_calculated = summary.get('pending_total', 0)
 
         formatted_values.append([f"Stakeholder: {name}"])
-        formatted_values.append(["-" * 60]) # Separator line
-        # Main Table Header
+        formatted_values.append(["-" * 70]) # Adjusted separator length
         formatted_values.append([
             "Initial Category", "Assigned Today", "Actioned Today", "Pending Today", "Final Status Breakdown (Actioned)"
         ])
-        formatted_values.append(["-" * 60]) # Separator line
+        formatted_values.append(["-" * 70])
 
-        # Data Rows for each assignment category
-        # Use the order defined in ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT for consistency
-        for category in ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT:
+        for category in ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT: # Use defined order
             assigned_count = summary['assigned_categories'].get(category, 0)
+            # Ensure actioned/pending keys exist, defaulting to 0 if category wasn't processed (e.g. "Unknown" was used)
             actioned_count = summary['actioned_by_initial_category'].get(category, 0)
             pending_count = summary['pending_by_initial_category'].get(category, 0)
             
-            # Build the breakdown string (only for actioned items)
             breakdown_parts = []
-            if category == "Abandoned": # Use Abandoned statuses
-                 for status, count in summary['final_statuses_abandoned'].items():
-                     # Only show breakdown relevant to this initial category if possible - difficult without more data
-                     # For now, show all actioned Abandoned outcomes here.
-                     if count > 0 and status != "Other Actioned (Abandoned)": # Exclude "Other" for cleaner look? Or include it?
-                         breakdown_parts.append(f"{status}: {count}")
-                 # Add "Other" if it has counts
-                 other_count = summary['final_statuses_abandoned'].get("Other Actioned (Abandoned)", 0)
-                 if other_count > 0:
-                      breakdown_parts.append(f"Other Actioned (Abandoned): {other_count}")
+            # Determine which set of final statuses to use
+            if category == "Abandoned": # Assuming "Abandoned" is a distinct category from your sheet
+                relevant_final_statuses = summary['final_statuses_abandoned']
+                other_key = "Other Actioned (Abandoned)"
+            else: # For "Fresh", "CNP", "NDR", etc.
+                relevant_final_statuses = summary['final_statuses_orders']
+                other_key = "Other Actioned (Orders)"
 
-            else: # Use Orders statuses for other categories
-                 for status, count in summary['final_statuses_orders'].items():
-                     # Similar challenge: relating final status back to initial category isn't perfect
-                     # Show all actioned Order outcomes here.
-                     if count > 0 and status != "Other Actioned (Orders)":
-                         breakdown_parts.append(f"{status}: {count}")
-                 other_count = summary['final_statuses_orders'].get("Other Actioned (Orders)", 0)
-                 if other_count > 0:
-                     breakdown_parts.append(f"Other Actioned (Orders): {other_count}")
+            # Only build breakdown if this *specific initial category* had actioned items.
+            # This is an approximation; ideally, final statuses would be tagged with their initial category.
+            if actioned_count > 0: # If this category had actions
+                # This part is tricky: 'relevant_final_statuses' are totals for the stakeholder,
+                # not specific to 'category'. So, we show all actioned outcomes for the stakeholder here.
+                # A more precise breakdown per *initial category* would require more granular data.
+                temp_breakdown_parts = []
+                for status, count in relevant_final_statuses.items():
+                    if count > 0 and status != other_key:
+                        temp_breakdown_parts.append(f"{status}: {count}")
+                other_val = relevant_final_statuses.get(other_key, 0)
+                if other_val > 0:
+                    temp_breakdown_parts.append(f"{other_key}: {other_val}")
+                
+                if temp_breakdown_parts: # If any final statuses exist for this stakeholder
+                    breakdown_parts = temp_breakdown_parts
             
-            breakdown_string = ", ".join(breakdown_parts) if breakdown_parts else "-" # Use "-" if no actioned outcomes
-
-            formatted_values.append([
-                category, assigned_count, actioned_count, pending_count, breakdown_string
-            ])
-
-        # Handle potentially "Unknown" initial categories if they occurred
+            breakdown_string = ", ".join(breakdown_parts) if breakdown_parts else "-"
+            formatted_values.append([category, assigned_count, actioned_count, pending_count, breakdown_string])
+        
+        # Handle "Unknown Initial Category" if it has counts
         unknown_actioned = summary['actioned_by_initial_category'].get("Unknown Initial Category Actioned", 0)
         unknown_pending = summary['pending_by_initial_category'].get("Unknown Initial Category Pending", 0)
         if unknown_actioned > 0 or unknown_pending > 0:
-             formatted_values.append([
-                "Unknown Initial", 0, unknown_actioned, unknown_pending, "N/A (Check Logs/Config)"
-            ])
+            formatted_values.append(["Unknown Initial", 0, unknown_actioned, unknown_pending, "N/A (Check Logs)"])
 
-
-        # Totals Row
-        formatted_values.append(["-" * 60]) # Separator line
+        formatted_values.append(["-" * 70])
+        discrepancy = assigned_total_from_report - (actioned_total_calculated + pending_total_calculated)
         formatted_values.append([
-            "TOTAL", assigned_total_from_report, actioned_total_calculated, pending_total_calculated, f"(Discrepancy vs Assigned: {assigned_total_from_report - (actioned_total_calculated + pending_total_calculated)})"
+            "TOTAL", assigned_total_from_report, actioned_total_calculated, pending_total_calculated, 
+            f"(Assigned vs Calc. Discrepancy: {discrepancy})"
         ])
-        formatted_values.append([]) # Blank row between stakeholders
+        formatted_values.append([])
 
-    # --- Report Footer ---
     formatted_values.append([f"--- End of Performance Report for {today_date_str_display} ---"])
 
     # --- Writing Logic ---
-    report_title_pattern = "--- Stakeholder Performance Report for " # For finding existing report
-    
-    # Use find_existing_report_range (ensure it's defined correctly in your script)
+    report_title_pattern = "--- Stakeholder Performance Report for "
     start_row_existing, end_row_existing = find_existing_report_range(
-        sheet, spreadsheet_id, report_sheet_name, report_title_pattern, today_date_str_display
+        sheet_api, spreadsheet_id, report_sheet_name, report_title_pattern, today_date_str_display
     )
 
-    if start_row_existing is not None and end_row_existing is not None:
-        logger.info(f"Existing performance report for {today_date_str_display} found. Clearing and updating rows {start_row_existing}-{end_row_existing}.")
-        # Clear existing range first
-        # Note: Clearing more columns (e.g., A:Z) ensures old data with different widths is removed.
-        range_to_clear = f"'{report_sheet_name}'!A{start_row_existing}:Z{end_row_existing}"
-        try:
-            clear_body = {} # Empty body for clear
-            sheet.values().clear(spreadsheetId=spreadsheet_id, range=range_to_clear, body=clear_body).execute()
+    try:
+        if start_row_existing is not None and end_row_existing is not None:
+            logger.info(f"Existing performance report for {today_date_str_display} found. Clearing rows {start_row_existing}-{end_row_existing} and updating.")
+            range_to_clear = f"'{report_sheet_name}'!A{start_row_existing}:J{end_row_existing}" # Clear up to J or wider
+            sheet_api.values().clear(spreadsheetId=spreadsheet_id, range=range_to_clear, body={}).execute()
             logger.info(f"Cleared existing report range: {range_to_clear}")
-        except HttpError as e:
-            logger.error(f"API Error clearing existing report range {range_to_clear}: {e}")
-            # Decide if you want to proceed with writing anyway or stop
-        except Exception as e:
-             logger.exception(f"Unexpected error clearing existing report range:")
-             # Decide if you want to proceed
 
-        # Write new data starting at the original start row
-        range_to_write = f"'{report_sheet_name}'!A{start_row_existing}"
-        try:
+            range_to_write = f"'{report_sheet_name}'!A{start_row_existing}"
             body = {'values': formatted_values}
-            result = sheet.values().update(
+            result = sheet_api.values().update(
                 spreadsheetId=spreadsheet_id, range=range_to_write,
-                valueInputOption='USER_ENTERED', body=body).execute() # USER_ENTERED preserves formats
-            logger.info(f"Performance report updated in '{report_sheet_name}'. {result.get('updatedCells', 'N/A')} cells updated.")
-        except HttpError as e:
-            logger.error(f"API Error updating performance report: {e}")
-        except Exception as e:
-            logger.exception("Unexpected error updating performance report:")
+                valueInputOption='USER_ENTERED', body=body).execute()
+            logger.info(f"Performance report updated. {result.get('updatedCells', 'N/A')} cells updated.")
+            sheet_update_successful = True
+        else:
+            logger.info(f"No existing report for {today_date_str_display}. Appending new report to '{report_sheet_name}'.")
+            start_row_for_append = 1
+            try:
+                result_existing = sheet_api.values().get(spreadsheetId=spreadsheet_id, range=f"'{report_sheet_name}'!A:A").execute()
+                existing_sheet_values = result_existing.get('values', [])
+                if existing_sheet_values:
+                    start_row_for_append = len(existing_sheet_values) + 2 # Add blank line
+            except HttpError as e_get:
+                if 'Unable to parse range' in str(e_get) or (hasattr(e_get, 'resp') and e_get.resp.status == 400 and "unable to parse range" in str(e_get.content).lower()):
+                    logger.warning(f"Sheet '{report_sheet_name}' not found. Creating it.")
+                    add_sheet_body = {'requests': [{'addSheet': {'properties': {'title': report_sheet_name}}}]}
+                    sheet_api.batchUpdate(spreadsheetId=spreadsheet_id, body=add_sheet_body).execute()
+                    logger.info(f"Created sheet '{report_sheet_name}'.")
+                    start_row_for_append = 1
+                else:
+                    logger.error(f"API Error checking for last row in '{report_sheet_name}': {e_get}")
+                    return False # Cannot safely append
 
-    else: # Append new report
-        logger.info(f"No existing performance report found for {today_date_str_display}. Appending new report to '{report_sheet_name}'.")
-        start_row_for_append = 1
-        try:
-            # Check last row of sheet (safer: check column A)
-             result_existing = sheet.values().get(spreadsheetId=spreadsheet_id, range=f"'{report_sheet_name}'!A:A").execute()
-             existing_values = result_existing.get('values', [])
-             if existing_values:
-                 start_row_for_append = len(existing_values) + 2 # Add blank line before new report
-        except HttpError as e:
-            # If sheet doesn't exist, create it
-            if 'Unable to parse range' in str(e) or (hasattr(e, 'resp') and e.resp.status == 400):
-                 logger.warning(f"Performance report sheet '{report_sheet_name}' not found. Creating it.")
-                 try:
-                     add_sheet_body = {'requests': [{'addSheet': {'properties': {'title': report_sheet_name}}}]}
-                     sheet.batchUpdate(spreadsheetId=spreadsheet_id, body=add_sheet_body).execute()
-                     logger.info(f"Created sheet '{report_sheet_name}'.")
-                     start_row_for_append = 1 # Start at row 1 in new sheet
-                 except Exception as create_err:
-                     logger.error(f"Failed to create sheet '{report_sheet_name}': {create_err}")
-                     return # Cannot write report
-            else: # Re-raise other API errors
-                 logger.error(f"API Error checking for last row in '{report_sheet_name}': {e}")
-                 return # Cannot safely append
-        except Exception as e:
-             logger.exception("Unexpected error finding last row for append:")
-             return
-
-        # Append the formatted data
-        range_to_append = f"'{report_sheet_name}'!A{start_row_for_append}"
-        try:
+            range_to_append = f"'{report_sheet_name}'!A{start_row_for_append}"
             body = {'values': formatted_values}
-            result = sheet.values().update(
+            result = sheet_api.values().update(
                 spreadsheetId=spreadsheet_id, range=range_to_append,
                 valueInputOption='USER_ENTERED', body=body).execute()
-            logger.info(f"Performance report appended to '{report_sheet_name}'. {result.get('updatedCells', 'N/A')} cells updated.")
-        except HttpError as e:
-            logger.error(f"API Error appending performance report: {e}")
-        except Exception as e:
-            logger.exception("Unexpected error appending performance report:")
+            logger.info(f"Performance report appended. {result.get('updatedCells', 'N/A')} cells updated.")
+            sheet_update_successful = True
+    except HttpError as e:
+        logger.error(f"API Error during report writing/updating: {e}")
+    except Exception as e:
+        logger.exception("Unexpected error during report writing/updating:")
+        
+    return sheet_update_successful
 
 # --- Main Performance Analysis Function (generate_performance_report) --- MODIFIED
 def generate_performance_report(service, settings):
     logger.info("Starting Performance Report Generation.")
     
-    # <<< START DATE MODIFICATION >>>
     today = datetime.date.today()
-    today_date_str_padded = today.strftime("%d-%b-%Y") # e.g., 08-May-2025
-    today_date_str_unpadded = today.strftime(f"{today.day}-%b-%Y") # e.g., 8-May-2025 or 10-May-2025
-    # Use a tuple of formats to check against sheet data
-    today_date_formats_to_check = (today_date_str_padded, today_date_str_unpadded)
-    # Use the padded format for consistency when referring to 'today' in report titles etc.
-    today_date_display = today_date_str_padded
-    logger.info(f"Analyzing performance for assignments with dates: {today_date_formats_to_check}")
-    # <<< END DATE MODIFICATION >>>
+    today_date_str_padded = today.strftime("%d-%b-%Y") 
+    today_date_str_unpadded = today.strftime(f"{int(today.day)}-%b-%Y") # Ensure day is int for no padding
+    today_date_formats_to_check = tuple(sorted(list(set([today_date_str_padded, today_date_str_unpadded])), reverse=True)) # Unique, sorted
+    today_date_display = today_date_str_padded # For report titles
+    logger.info(f"Analyzing performance for assignments with dates matching any of: {today_date_formats_to_check}")
 
     stakeholder_list_config = settings['stakeholders']
     stakeholder_names = [s['name'] for s in stakeholder_list_config]
@@ -865,9 +836,13 @@ def generate_performance_report(service, settings):
     abandoned_spreadsheet_id = settings['sheets']['abandoned_spreadsheet_id']
     assignment_report_sheet_name = settings['sheets']['report_sheet_name']
     
-    # Ensure all expected categories + potential unknowns are keys in the summary dicts
-    _assignment_cats_extended = ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT + ["Unknown Initial Category Actioned", "Unknown Initial Category Pending", "Abandoned"]
-    _assignment_cats_extended = sorted(list(set(_assignment_cats_extended))) # Unique and sorted
+    # Define unique categories for initializing summary dicts robustly
+    # Include all from ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT
+    # and specific "Unknown..." and "Abandoned" keys if they differ
+    _summary_categories = list(set(
+        ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT +
+        ["Unknown Initial Category Actioned", "Unknown Initial Category Pending", "Abandoned"]
+    ))
 
     performance_summary = {
         s_name: {
@@ -875,52 +850,37 @@ def generate_performance_report(service, settings):
             "assigned_total": 0,
             "actioned_total": 0,
             "pending_total": 0,
-            "actioned_by_initial_category": {cat: 0 for cat in _assignment_cats_extended},
-            "pending_by_initial_category": {cat: 0 for cat in _assignment_cats_extended},
+            "actioned_by_initial_category": {cat: 0 for cat in _summary_categories}, # Use comprehensive list
+            "pending_by_initial_category": {cat: 0 for cat in _summary_categories},  # Use comprehensive list
             "final_statuses_orders": {fs: 0 for fs in PERFORMANCE_FINAL_STATUSES_ORDERS + ["Other Actioned (Orders)"]},
             "final_statuses_abandoned": {fs: 0 for fs in PERFORMANCE_FINAL_STATUSES_ABANDONED + ["Other Actioned (Abandoned)"]},
         } for s_name in stakeholder_names
     }
     
-    # Initialize skip counters
-    skipped_orders_blank_initial_cat = 0
-    skipped_orders_other = 0
-    skipped_abandoned_blank_initial_cat = 0
-    skipped_abandoned_other = 0
+    skipped_orders_blank_initial_cat, skipped_orders_other = 0, 0
+    skipped_abandoned_blank_initial_cat, skipped_abandoned_other = 0, 0
 
     # --- 1. Read Today's Assignment Data ---
-    # Use the display date (padded) for matching the report title format
     assigned_category_counts, assigned_total_counts = read_todays_assignment_report(
         service, orders_spreadsheet_id, assignment_report_sheet_name,
-        today_date_display, # Use consistent format for report title
+        today_date_display, 
         stakeholder_names, ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT
     )
     for s_name in stakeholder_names:
         performance_summary[s_name]["assigned_categories"] = assigned_category_counts.get(s_name, {cat: 0 for cat in ASSIGNMENT_CATEGORIES_FOR_PERFORMANCE_REPORT})
         performance_summary[s_name]["assigned_total"] = assigned_total_counts.get(s_name, 0)
-        # Log the assigned counts read from the report
         logger.info(f"Read from Assignment Report - {s_name}: Assigned Total = {performance_summary[s_name]['assigned_total']}")
-        logger.debug(f"  Assigned Categories: {performance_summary[s_name]['assigned_categories']}")
-
 
     # --- 2. Process "Orders" Sheet for Actions ---
-    # Pass the TUPLE of date formats to check against sheet data
     skipped_orders_blank_initial_cat, skipped_orders_other = process_orders_sheet_for_actions(
-        service,
-        orders_spreadsheet_id,
-        today_date_formats_to_check, # <<< Pass tuple
-        stakeholder_names,
-        performance_summary # Pass by reference
+        service, orders_spreadsheet_id, today_date_formats_to_check, 
+        stakeholder_names, performance_summary
     )
 
     # --- 3. Process "Abandoned" Sheet for Actions ---
-    # Pass the TUPLE of date formats to check against sheet data
     skipped_abandoned_blank_initial_cat, skipped_abandoned_other = process_abandoned_sheet_for_actions(
-        service,
-        abandoned_spreadsheet_id,
-        today_date_formats_to_check, # <<< Pass tuple
-        stakeholder_names,
-        performance_summary # Update the same summary dict
+        service, abandoned_spreadsheet_id, today_date_formats_to_check, 
+        stakeholder_names, performance_summary
     )
 
     # --- Log final summary and SKIPS ---
@@ -928,48 +888,76 @@ def generate_performance_report(service, settings):
     total_skipped_blank_cat = skipped_orders_blank_initial_cat + skipped_abandoned_blank_initial_cat
     total_skipped_other = skipped_orders_other + skipped_abandoned_other
     logger.info(f"Total rows skipped due to BLANK Initial Category: {total_skipped_blank_cat}")
-    logger.info(f"Total rows skipped for OTHER reasons (e.g., no stakeholder, date mismatch): {total_skipped_other}")
+    logger.info(f"Total rows skipped for OTHER reasons (no stakeholder, date mismatch, short row): {total_skipped_other}")
 
     for s_name in stakeholder_names:
-        assigned_total = performance_summary[s_name]['assigned_total'] # From assignment report
-        actioned_total = performance_summary[s_name]['actioned_total'] # Calculated from sheets
-        pending_total = performance_summary[s_name]['pending_total']   # Calculated from sheets
-        calculated_total = actioned_total + pending_total
-        # Compare assigned total (from report) with calculated total (from sheet analysis)
-        discrepancy = assigned_total - calculated_total
-        
-        logger.info(f"Summary - {s_name}: Assigned={assigned_total}, Actioned={actioned_total}, Pending={pending_total} (Calculated Total={calculated_total}, Discrepancy={discrepancy})")
-        # Log details only if DEBUG is enabled potentially
-        logger.debug(f"  Actioned by Initial Cat: {performance_summary[s_name]['actioned_by_initial_category']}")
-        logger.debug(f"  Pending by Initial Cat: {performance_summary[s_name]['pending_by_initial_category']}")
-        logger.debug(f"  Final Order Statuses: {performance_summary[s_name]['final_statuses_orders']}")
-        logger.debug(f"  Final Abandoned Statuses: {performance_summary[s_name]['final_statuses_abandoned']}")
-
-    # --- 4. Format and Write Performance Report --- <<< MODIFIED CALL
-    format_and_write_performance_report(
-        service,
-        settings,
-        performance_summary,
-        today_date_display # Pass the consistent display date string
+        assigned_total = performance_summary[s_name]['assigned_total']
+        actioned_total = performance_summary[s_name]['actioned_total']
+        pending_total = performance_summary[s_name]['pending_total']
+        calculated_processed_total = actioned_total + pending_total
+        discrepancy = assigned_total - calculated_processed_total
+        logger.info(f"Summary - {s_name}: Assigned={assigned_total}, Actioned={actioned_total}, Pending={pending_total} (Calc. Processed={calculated_processed_total}, Discrepancy={discrepancy})")
+    
+    # --- 4. Format and Write Performance Report ---
+    report_writing_success = format_and_write_performance_report(
+        service, settings, performance_summary, today_date_display
     )
-    logger.info("Placeholder for Formatting and Writing Performance Report...")
-    # Example call (function needs to be created):
-    # format_and_write_performance_report(service, settings, performance_summary, today_date_display)
-
-    logger.info("Performance Report Generation process completed.")
+    
+    if report_writing_success:
+        logger.info("Performance Report Generation process completed and report written.")
+    else:
+        logger.error("Performance Report Generation completed, but report writing FAILED or encountered issues.")
+        
+    return report_writing_success
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    logger.info("--- Performance Analyzer Script Started ---")
+    if not logger.handlers: 
+        LOG_FILE = 'performance_analyzer.log' 
+        logging.basicConfig(
+            level=logging.INFO, # Set to DEBUG for more verbose output
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(LOG_FILE),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        logger = logging.getLogger(__name__) 
+
+    logger.info(f"--- Performance Analyzer Script Started (PID: {os.getpid()}) ---")
+    
+    # Ensure PROJECT_ROOT_PERF_ANALYZER and LAST_PERF_RUN_TIMESTAMP_FILE are defined globally or passed appropriately
+    # For simplicity, assuming they are global based on earlier definition
+    if 'PROJECT_ROOT_PERF_ANALYZER' not in globals() or 'LAST_PERF_RUN_TIMESTAMP_FILE' not in globals():
+        logger.error("PROJECT_ROOT_PERF_ANALYZER or LAST_PERF_RUN_TIMESTAMP_FILE not defined globally. Cannot write timestamp.")
+        from pathlib import Path
+        PROJECT_ROOT_PERF_ANALYZER = Path(__file__).parent.resolve()
+        LAST_PERF_RUN_TIMESTAMP_FILE = PROJECT_ROOT_PERF_ANALYZER / "last_perf_run.txt"
+
+
     settings = load_settings(SETTINGS_FILE)
     if not settings or 'stakeholders' not in settings:
-        logger.error("Failed to load settings or stakeholders missing. Aborting.")
-        sys.exit(1)
+        logger.error("Failed to load settings or stakeholders missing. Aborting performance analysis.")
+        sys.exit(1) 
 
     service = authenticate_google_sheets()
     if not service:
-        logger.error("Google Sheets authentication failed. Aborting script.")
+        logger.error("Google Sheets authentication failed. Aborting performance analysis.")
         sys.exit(1)
 
-    generate_performance_report(service, settings) # Pass service and settings
-    logger.info("--- Performance Analyzer Script Finished ---")
+    generation_successful = generate_performance_report(service, settings)
+
+    if generation_successful:
+        logger.info("Performance analysis and report writing process completed successfully.")
+        try:
+            with open(LAST_PERF_RUN_TIMESTAMP_FILE, "w") as f:
+                f.write(datetime.datetime.now().isoformat())
+            logger.info(f"Successfully wrote last run timestamp to {LAST_PERF_RUN_TIMESTAMP_FILE}")
+        except Exception as e:
+            logger.error(f"Could not write last run timestamp: {e}")
+        logger.info("--- Performance Analyzer Script Finished Successfully ---")
+        sys.exit(0)
+    else:
+        logger.error("Performance analysis or report writing FAILED.")
+        logger.error("--- Performance Analyzer Script Finished With ERRORS ---")
+        sys.exit(1)

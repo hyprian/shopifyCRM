@@ -242,7 +242,7 @@ def load_and_parse_summary_sheet(_service, spreadsheet_id, sheet_name):
     if not parsed_data["kpis"].get("Total Orders"):
         return None, "Failed to parse 'Total Orders' metric, essential for dashboard."
 
-    st.success(f"Summary data parsed. Total Orders: {parsed_data['kpis']['Total Orders']}")
+    # st.success(f"Summary data parsed. Total Orders: {parsed_data['kpis']['Total Orders']}")
     return parsed_data, None # Data, Error Message
 
 # --- Main Page Content ---
