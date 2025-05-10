@@ -169,91 +169,53 @@ def load_settings(filename):
 def authenticate_google_sheets():
     """Authenticates using Streamlit secrets or local service account file."""
     creds = None
-    creds_info_dict = None # Initialize a variable to hold the dictionary form
-
     try:
-        if hasattr(st, 'secrets') and "GOOGLE_CREDENTIALS" in st.secrets:
-            logger.info("Attempting to load credentials from Streamlit secrets...")
-            raw_creds_info = st.secrets["GOOGLE_CREDENTIALS"]
-
-            if hasattr(raw_creds_info, 'to_dict'): # Check if it's a Streamlit Secrets LabeledSecret object
-                logger.debug("Secrets object has 'to_dict', using it.")
-                creds_info_dict = raw_creds_info.to_dict()
-            elif isinstance(raw_creds_info, dict): # Already a dictionary
-                logger.debug("Secrets object is already a dict.")
-                creds_info_dict = raw_creds_info
-            elif isinstance(raw_creds_info, str): # It's a string, try to parse as JSON
-                logger.debug("Secrets object is a string, attempting JSON parse.")
-                try:
-                    creds_info_dict = json.loads(raw_creds_info)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error decoding Streamlit secrets JSON string: {e}. Content hint: '{raw_creds_info[:100]}...'")
-                    # creds_info_dict remains None, will fall back to local file
-            else:
-                logger.warning(f"Streamlit secrets 'GOOGLE_CREDENTIALS' is of an unexpected type: {type(raw_creds_info)}. Falling back.")
-
-            if isinstance(creds_info_dict, dict):
-                if 'private_key' in creds_info_dict and isinstance(creds_info_dict['private_key'], str):
-                    creds_info_dict['private_key'] = creds_info_dict['private_key'].replace('\n', '\\n')
-                logger.debug(f"Streamlit secrets successfully processed into dict. Keys: {list(creds_info_dict.keys())}")
-                creds = service_account.Credentials.from_service_account_info(
-                    creds_info_dict, scopes=SCOPES)
-                logger.info("Credentials loaded successfully from Streamlit secrets.")
-            # else: creds_info_dict is None or not a dict, so creds remains None, will fall back
-        else:
-            logger.info("Streamlit secrets 'GOOGLE_CREDENTIALS' not found or st.secrets not available (normal for local subprocess).")
-    except AttributeError:
-        logger.info("st.secrets attribute not found (normal for local direct run without Streamlit context). Falling back.")
+        if 'GOOGLE_CREDENTIALS' in st.secrets:
+            logger.info("Loading credentials from Streamlit secrets...")
+            creds_info = st.secrets["GOOGLE_CREDENTIALS"].to_dict()
+            logger.debug(f"Streamlit secrets credentials keys: {list(creds_info.keys())}")
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info, scopes=SCOPES)
+            logger.info("Credentials loaded successfully from secrets.")
+    except (KeyError, FileNotFoundError, st.errors.StreamlitAPIException) as e:
+        logger.info(f"Streamlit secrets not found or inaccessible: {e}. Falling back to local service account file...")
     except Exception as e:
-        logger.error(f"An unexpected error occurred accessing/processing Streamlit secrets: {e}. Falling back to local file...")
+        logger.error(f"Unexpected error processing Streamlit secrets: {e}. Falling back to local file...")
 
-    # Fallback to local service account file
+    # Fallback to local service account file if secrets are unavailable
     if creds is None:
-        logger.info(f"Loading service account credentials from local file: '{SERVICE_ACCOUNT_FILE}'...")
+        logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
         try:
-            # Define SCRIPT_PROJECT_ROOT here for robust pathing if not already global for this function
-            # This makes the function more self-contained for local file access
-            current_script_path = Path(__file__).resolve()
-            # Try to determine project root assuming script is in project_root or project_root/pages
-            if current_script_path.parent.name == 'pages' and (current_script_path.parent.parent / 'settings.yaml').is_file():
-                script_project_root = current_script_path.parent.parent
-            else:
-                script_project_root = current_script_path.parent
-            
-            local_sa_file_path = script_project_root / SERVICE_ACCOUNT_FILE
-
-            if not local_sa_file_path.is_file():
-                logger.error(f"Error: Local service account key file '{local_sa_file_path}' not found.")
-                # Also log the current working directory to help debug path issues
-                logger.error(f"Current working directory: {Path.cwd()}")
-                return None
-
             creds = service_account.Credentials.from_service_account_file(
-                str(local_sa_file_path), scopes=SCOPES)
-            logger.info(f"Credentials loaded successfully from local file: '{local_sa_file_path}'.")
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+            logger.info("Credentials loaded successfully from local file.")
         except FileNotFoundError:
-            logger.error(f"Error: Service account key file '{local_sa_file_path}' not found (FileNotFoundError).")
+            logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
             return None
         except Exception as e:
-            logger.error(f"Error loading service account credentials from local file '{local_sa_file_path}': {e}")
+            logger.error(f"Error loading service account credentials from file: {e}")
             return None
 
     if creds is None:
-        logger.error("CRITICAL: No valid credentials loaded. Authentication failed.")
+        logger.error("No valid credentials loaded. Authentication failed.")
         return None
 
     logger.info("Building Google Sheets API service...")
     try:
         service = build('sheets', 'v4', credentials=creds)
         return service
-    except Exception as e: # Catch a broader range of exceptions during build
-        logger.error(f"Error during Google Sheets service build: {e}")
-        if isinstance(e, RefreshError):
-            logger.error("Auth RefreshError: Ensure key is valid/not revoked. For secrets, check private_key format.")
-        elif isinstance(e, HttpError):
-            logger.error("Sheets API HttpError: Ensure API is enabled and service account has permissions.")
+    except RefreshError as e:
+        logger.error(f"Authentication failed due to invalid credentials: {e}")
+        logger.error("Ensure the service account key is valid and not revoked. If using Streamlit secrets, verify the private_key format.")
         return None
-        
+    except HttpError as e:
+        logger.error(f"Google Sheets API Error during service build: {e}")
+        logger.error("Ensure the service account has Editor access to the spreadsheet.")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during service build: {e}")
+        return None
+            
 # --- Helper Function: Column Index to A1 (Copied from distributionV2.py) ---
 def col_index_to_a1(index):
     """Converts column index (0-based) to A1 notation (e.g., 0 -> A, 1 -> B)."""
