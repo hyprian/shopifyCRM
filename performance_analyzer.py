@@ -7,6 +7,7 @@ import logging
 import sys
 import json # Though not used yet, good to have for future flexibility
 from pathlib import Path
+import streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -17,6 +18,8 @@ SETTINGS_FILE = 'settings.yaml'
 SERVICE_ACCOUNT_FILE = 'molten-medley-458604-j9-855f3bdefd90.json' # Make sure this is correct
 
 PROJECT_ROOT_PERF_ANALYZER = Path(__file__).parent.resolve() # if in project root
+SETTINGS_FILE_PATH = PROJECT_ROOT_PERF_ANALYZER / SETTINGS_FILE # SETTINGS_FILE is 'settings.yaml'
+SERVICE_ACCOUNT_FILE_PATH = PROJECT_ROOT_PERF_ANALYZER / SERVICE_ACCOUNT_FILE # SERVICE_ACCOUNT_FILE is 'molten...json'
 LAST_PERF_RUN_TIMESTAMP_FILE = PROJECT_ROOT_PERF_ANALYZER / "last_perf_run.txt"
 
 # Scopes required for reading and writing
@@ -164,23 +167,70 @@ def load_settings(filename):
         return None
 
 # --- Authentication (Copied from distributionV2.py - no Streamlit secrets here) ---
-def authenticate_google_sheets():
-    """Authenticates using local service account file."""
+def authenticate_google_sheets(): # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< USE THIS VERSION
+    """Authenticates using Streamlit secrets or local service account file."""
     creds = None
-    logger.info(f"Loading service account credentials from '{SERVICE_ACCOUNT_FILE}'...")
+    # Check if running in Streamlit Cloud (or secrets are configured)
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        logger.info("Credentials loaded successfully from local file.")
-    except FileNotFoundError:
-        logger.error(f"Error: Service account key file '{SERVICE_ACCOUNT_FILE}' not found.")
-        return None
-    except Exception as e:
-        logger.error(f"Error loading service account credentials from file: {e}")
-        return None
+        # Check if st.secrets exists and has the GOOGLE_CREDENTIALS key
+        # The hasattr check is a bit safer in non-Streamlit contexts if st might not be fully initialized
+        if hasattr(st, 'secrets') and "GOOGLE_CREDENTIALS" in st.secrets:
+            logger.info("Attempting to load credentials from Streamlit secrets...")
+            creds_info = st.secrets["GOOGLE_CREDENTIALS"]
+            # If creds_info is a string (e.g. from TOML), parse it as JSON
+            if isinstance(creds_info, str):
+                try:
+                    creds_info = json.loads(creds_info)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error decoding Streamlit secrets JSON string: {e}")
+                    creds_info = None # Fallback to file
 
+            if isinstance(creds_info, dict):
+                logger.debug(f"Streamlit secrets credentials keys: {list(creds_info.keys())}")
+                creds = service_account.Credentials.from_service_account_info(
+                    creds_info, scopes=SCOPES)
+                logger.info("Credentials loaded successfully from Streamlit secrets.")
+            elif creds_info is not None: # It was a string but couldn't be parsed
+                 logger.warning("Streamlit secrets 'GOOGLE_CREDENTIALS' was a string but not valid JSON. Falling back.")
+        else:
+            logger.info("Streamlit secrets 'GOOGLE_CREDENTIALS' not found or st.secrets not available.")
+            # This log helps distinguish from errors during parsing
+            
+    except AttributeError: # If 'st' doesn't have 'secrets' (e.g. running outside Streamlit fully)
+        logger.info("st.secrets attribute not found. Likely not running in a Streamlit environment that supports it. Falling back.")
+    except Exception as e: # Catch any other errors during secrets access/parsing
+        logger.error(f"An unexpected error occurred accessing Streamlit secrets: {e}. Falling back to local file...")
+        # Do not return None here, let it fall through to local file logic
+
+    # Fallback to local service account file if secrets are unavailable or failed
     if creds is None:
-        logger.error("No valid credentials loaded. Authentication failed.")
+        logger.info(f"Loading service account credentials from local file: '{SERVICE_ACCOUNT_FILE}'...")
+        try:
+            # Ensure SERVICE_ACCOUNT_FILE is an absolute path or relative to current working directory
+            # If performance_analyzer.py is in a subdirectory, this path needs to be correct from where it's run
+            # For scripts run by subprocess from project root, PROJECT_ROOT / SERVICE_ACCOUNT_FILE is safer
+            script_dir = Path(__file__).parent.resolve()
+            local_sa_file_path = script_dir / SERVICE_ACCOUNT_FILE # Assuming SERVICE_ACCOUNT_FILE is in the same dir as script
+            # Or, if you always define PROJECT_ROOT globally in this script:
+            # PROJECT_ROOT = Path(__file__).parent.resolve() # Or parent.parent if nested
+            # local_sa_file_path = PROJECT_ROOT / SERVICE_ACCOUNT_FILE
+
+            if not local_sa_file_path.is_file():
+                logger.error(f"Error: Local service account key file '{local_sa_file_path}' not found.")
+                return None # Critical error if local file also not found
+
+            creds = service_account.Credentials.from_service_account_file(
+                str(local_sa_file_path), scopes=SCOPES)
+            logger.info(f"Credentials loaded successfully from local file: '{local_sa_file_path}'.")
+        except FileNotFoundError: # This is redundant due to the is_file() check but good for clarity
+            logger.error(f"Error: Service account key file '{local_sa_file_path}' not found (FileNotFoundError).")
+            return None
+        except Exception as e:
+            logger.error(f"Error loading service account credentials from local file '{local_sa_file_path}': {e}")
+            return None
+
+    if creds is None: # Should be caught by earlier returns if both methods fail
+        logger.error("CRITICAL: No valid credentials loaded from Streamlit secrets or local file. Authentication failed.")
         return None
 
     logger.info("Building Google Sheets API service...")
@@ -188,15 +238,17 @@ def authenticate_google_sheets():
         service = build('sheets', 'v4', credentials=creds)
         return service
     except RefreshError as e:
-        logger.error(f"Authentication failed due to invalid credentials: {e}")
+        logger.error(f"Authentication failed due to invalid credentials (RefreshError): {e}")
+        logger.error("Ensure the service account key is valid and not revoked. If using Streamlit secrets, verify the private_key format.")
         return None
     except HttpError as e:
-        logger.error(f"Google Sheets API Error during service build: {e}")
+        logger.error(f"Google Sheets API Error during service build (HttpError): {e}")
+        logger.error("Ensure the service account has Editor access to the spreadsheet and Sheets API is enabled.")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error during service build: {e}")
+        logger.error(f"Unexpected error during Google Sheets service build: {e}")
         return None
-
+    
 # --- Helper Function: Column Index to A1 (Copied from distributionV2.py) ---
 def col_index_to_a1(index):
     """Converts column index (0-based) to A1 notation (e.g., 0 -> A, 1 -> B)."""
@@ -912,33 +964,27 @@ def generate_performance_report(service, settings):
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    if not logger.handlers: 
-        LOG_FILE = 'performance_analyzer.log' 
+    # Ensure logging is set up if run as main script
+    if not logger.handlers:
+        # LOG_FILE is already defined globally
         logging.basicConfig(
-            level=logging.INFO, # Set to DEBUG for more verbose output
+            level=logging.DEBUG, # Use DEBUG for testing, INFO for production
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(LOG_FILE),
+                logging.FileHandler(PROJECT_ROOT_PERF_ANALYZER / LOG_FILE), # Path for log file
                 logging.StreamHandler(sys.stdout)
             ]
         )
-        logger = logging.getLogger(__name__) 
+        logger = logging.getLogger(__name__) # Re-assign logger if handlers were just added
 
-    logger.info(f"--- Performance Analyzer Script Started (PID: {os.getpid()}) ---")
-    
-    # Ensure PROJECT_ROOT_PERF_ANALYZER and LAST_PERF_RUN_TIMESTAMP_FILE are defined globally or passed appropriately
-    # For simplicity, assuming they are global based on earlier definition
-    if 'PROJECT_ROOT_PERF_ANALYZER' not in globals() or 'LAST_PERF_RUN_TIMESTAMP_FILE' not in globals():
-        logger.error("PROJECT_ROOT_PERF_ANALYZER or LAST_PERF_RUN_TIMESTAMP_FILE not defined globally. Cannot write timestamp.")
-        from pathlib import Path
-        PROJECT_ROOT_PERF_ANALYZER = Path(__file__).parent.resolve()
-        LAST_PERF_RUN_TIMESTAMP_FILE = PROJECT_ROOT_PERF_ANALYZER / "last_perf_run.txt"
+    pid = os.getpid() # For logging
+    logger.info(f"--- Performance Analyzer Script Started (PID: {pid}) ---")
 
-
-    settings = load_settings(SETTINGS_FILE)
-    if not settings or 'stakeholders' not in settings:
-        logger.error("Failed to load settings or stakeholders missing. Aborting performance analysis.")
-        sys.exit(1) 
+    # Use the globally defined SETTINGS_FILE_PATH
+    settings = load_settings(str(SETTINGS_FILE_PATH))
+    if not settings or 'stakeholders' not in settings: # Redundant check, load_settings handles it
+        logger.error("Critical settings missing after load_settings call. Aborting.")
+        sys.exit(1)
 
     service = authenticate_google_sheets()
     if not service:
@@ -950,14 +996,15 @@ if __name__ == '__main__':
     if generation_successful:
         logger.info("Performance analysis and report writing process completed successfully.")
         try:
+            # Use the globally defined LAST_PERF_RUN_TIMESTAMP_FILE
             with open(LAST_PERF_RUN_TIMESTAMP_FILE, "w") as f:
                 f.write(datetime.datetime.now().isoformat())
             logger.info(f"Successfully wrote last run timestamp to {LAST_PERF_RUN_TIMESTAMP_FILE}")
         except Exception as e:
             logger.error(f"Could not write last run timestamp: {e}")
-        logger.info("--- Performance Analyzer Script Finished Successfully ---")
+        logger.info(f"--- Performance Analyzer Script Finished Successfully (PID: {pid}) ---")
         sys.exit(0)
     else:
         logger.error("Performance analysis or report writing FAILED.")
-        logger.error("--- Performance Analyzer Script Finished With ERRORS ---")
+        logger.error(f"--- Performance Analyzer Script Finished With ERRORS (PID: {pid}) ---")
         sys.exit(1)
